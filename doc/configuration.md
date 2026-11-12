@@ -271,12 +271,23 @@ the tables above, plus, once a managed App exists (v1.7.0+), `app.id`,
 `app.privateKey` (PEM) and `app.slug`. The plugin never has to mutate
 `internal.properties`.
 
-Two **caches** live apart from it, under
+Two **stores** live apart from it, under
 `<TC_DATA_DIR>/system/pluginData/teamcity-github-bridge/` (1.11.0+):
-`open-check-runs.tsv` (rows left `queued` / `in_progress`, reconciled after
-startup and every ten minutes) and `applied-labels.tsv` (labels the bridge
-added, so one removed by hand is not put back). Neither needs a backup;
-deleting one only loses that repair.
+`open-check-runs.tsv` (the lifecycle Check Run id, promotion identity and
+recovery state; open entries are reconciled after startup and every ten
+minutes) and `applied-labels.tsv` (labels the bridge added, so one removed by
+hand is not put back). The Check Run ledger appends changed rows and compacts
+its journal after 512 updates or 1 MiB. It retains terminal rows for up to 90
+days, capped at 4,096 rows; a durable installation namespace and stable
+promotion correlation let a later callback recover the exact remote run after
+its terminal row ages out. Active and unresolved legacy rows stay until they
+can be concluded, so a persistently stuck build or unavailable repository
+configuration can still grow the active set. Preserve `open-check-runs.tsv`
+across server restarts.
+If an older four-column row is found, it is loaded and migrated, but it has no
+GitHub run id or correlation key; the plugin leaves it unresolved rather than
+guessing which same-name run to change. A missing or damaged registry pauses
+Check Run writes until storage is available or repaired.
 
 You can edit this file by hand if you prefer, but the admin page is
 the supported path.
@@ -454,7 +465,7 @@ a scope filter excluded it (draft PR, branch list, path filter, PR metadata), or
 | `triggerOnBranch` | trigger | `true` | **Triggers** → Run on branches | Does the bridge trigger this build configuration on non-PR branches? Unchecked = no automatic branch build **and nothing removed either**: a Run, a schedule or a VCS trigger still works, and still reports. |
 | `triggerOnPrReady` | trigger | `true` | **Triggers** → Run on PR (ready) | Is this build configuration part of the PR check set (ready PRs and draft→ready transitions)? Unchecked = the bridge never enqueues it from a PR event and posts no `Skipped` row for it; an explicit Run or command still works and reports. |
 | `triggerOnPrDraft` | trigger | `false` | **Triggers** → Run on PR (draft) | Also trigger on draft PR events. **Opt-in since 1.11.0** (it defaulted to `true` before). On a **composite**, it builds the whole snapshot chain on drafts whatever each dependency says; the admin self-test **Draft setting along composite chains** flags it. **Requires `triggerOnPrReady=true`** (validated at save; a stored `ready=off, draft=on` is clamped to off). Unchecked: an **automatic** draft build is dropped with a `Skipped: draft PR` Check Run, while an explicit Run or GitHub command on a draft still runs. |
-| `skipIfCommitPassed` | trigger | `false` | **Triggers** → Reuse a passed commit *(advanced)* | When an **automatic** build is queued for a commit that already passed in this build configuration, drop it and republish that success (`Build passed (reused #87)`, linking to the build that ran). Matched on the commit alone, any ref — GitHub keys a Check Run on `(name, commit)`, so two refs of one commit are one row. A manual Run, a GitHub command and the Re-run buttons always re-run. **Leave off for scheduled suites**: a nightly is expected to re-run on an unchanged commit. |
+| `skipIfCommitPassed` | trigger | `false` | **Triggers** → Reuse a passed commit *(advanced)* | When an **automatic** build is queued for a commit that already passed in this build configuration, drop it and report that success (`Build passed (reused #87)`, linking to the build that ran). Matched on the commit alone, any ref; this avoids rebuilding identical source. Each reported TeamCity promotion still has its own Check Run. A manual Run, a GitHub command and the Re-run buttons always re-run. **Leave off for scheduled suites**: a nightly is expected to re-run on an unchanged commit. |
 | `branchTriggerBranchesOverride` | SOFT | _empty_ (inherit) | **Filters** → Non-PR branches *(advanced)* | When set, **REPLACES** the project's `branchTrigger.branches` for this BuildType. Same VCS branch-filter syntax. Empty = inherit project's list. |
 | `prTriggerBranchesOverride` | SOFT | _empty_ (inherit) | **Filters** → PR branches *(advanced)* | When set, **REPLACES** the project's `prTrigger.branches` for this BuildType. Matched against the PR source branch. Empty = inherit. Auto enqueues for excluded PRs post a `Skipped: branch out of scope` Check Run. |
 | `pathFilter` | SOFT | _empty_ (= all paths) | **Filters** → Changed paths | When set, the listener only enqueues this BuildType for a PR if at least one of the PR's changed files matches. VCS-filter syntax (`+:src/api/**` / `-:docs/*` per line; `*` spans `/`). Enforced **only for PR webhook triggers** (it needs the PR file list from GitHub). A non-matching PR gets a `Skipped: paths out of scope` Check Run. |
@@ -702,7 +713,7 @@ Reload via `Administration -> Diagnostics -> Logging` or restart.
 By default a PR build runs on the synthetic **`pull/N`** ref: TeamCity shows
 `pull/189` in its Branch column, and a work branch that also has a VCS
 trigger builds **twice** per push (once as `Feature/foo`, once as
-`pull/189`) with both builds fighting over the same Check Run row.
+`pull/189`) with two separate Check Runs that have the same name and SHA.
 
 Set the project's **Build PRs on their own branch** checkbox
 (`teamcity.github.bridge.prBuildRef = branch`) and the bridge enqueues PR
@@ -811,9 +822,26 @@ description) unless you disable it.
 
 ### What the plugin emits
 
-Since v1.3.0 every lifecycle transition is mapped to a Check Run.
-GitHub dedups by `(name, head_sha)` so the same row transitions
-through every state.
+Each TeamCity promotion creates one Check Run on its first lifecycle event.
+The bridge stores GitHub's numeric run id and uses `PATCH /check-runs/{id}` for
+later queue, start, completion, cancellation and reconciliation events. Its
+`external_id` carries a stable correlation scoped to the plugin installation
+and promotion identity (build configuration, repository, check name and SHA).
+This lets reconciliation find an uncertain create or an aged-out completed
+row without posting another run.
+Distinct promotions and reruns keep separate Check Run ids even when their
+check name and SHA match.
+If GitHub's create response is uncertain, the bridge never repeats the POST.
+Reconciliation looks up the exact persisted `external_id`; if GitHub cannot
+confirm a unique match, the entry stays pending and no replacement run is
+created automatically. PATCH requests carry mutable status/output fields and
+omit `head_sha`, `name` and `external_id` so the run's identity stays fixed.
+After restart, reconciliation resumes a still-queued create only when the
+registry proves that POST never started or GitHub explicitly rejected it; an
+uncertain create remains lookup-only.
+The transport uses Java 21's built-in HTTP client with the bridge's connection
+and request timeouts, API-version and authentication headers, full response
+bodies, and existing retry rules.
 
 | Event | Check Run `status` | Check Run `conclusion` | `output.title` |
 |---|---|---|---|
@@ -823,6 +851,7 @@ through every state.
 | Build interrupted (early stop signal) | `completed` | `cancelled` | `Build cancelled` |
 | Build stopped by the bridge because a push superseded it | `completed` | `skipped` | `Superseded by <short sha>` |
 | Build removed from queue by a user | `completed` | `cancelled` | `Cancelled before start` |
+| System removal without a verified outcome | Keep the existing status pending reconciliation; a run not yet created waits before any POST | Matching build's actual result, or `cancelled` when no matching build exists | Matching build title / `Build no longer in TeamCity` |
 | Build finishes (success / warning) | `completed` | `success` | `Build passed` |
 | Build finishes (failure / error) | `completed` | `failure` | `Build failed` |
 | Build finishes (cancelled) | `completed` | `cancelled` | `Build cancelled` |
@@ -836,6 +865,10 @@ for a chain member whose commit already passed in its configuration (the
 chain reuses that build, so the green row stays), and a row left `queued` or
 `in_progress` by a missed event is concluded by the periodic reconciliation —
 see [troubleshooting.md](troubleshooting.md#symptom-a-check-run-stays-in-progress-or-queued-after-the-build-finished).
+A system queue-removal event alone does not produce a successful `skipped` or
+`neutral` result. A matching associated build can supply its observed outcome;
+otherwise reconciliation reports a matching completed build or concludes the
+removed promotion as cancelled.
 
 `output.summary` carries the build's `statusDescriptor.text` (i.e.
 whatever the agent set via

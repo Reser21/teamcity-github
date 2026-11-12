@@ -4,8 +4,12 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.node.ObjectNode
 import com.intellij.openapi.diagnostic.Logger
-import java.net.HttpURLConnection
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse as JdkHttpResponse
 import java.net.URI
+import java.nio.charset.StandardCharsets
+import java.time.Duration
 import java.time.Instant
 
 open class GitHubClient {
@@ -69,22 +73,107 @@ open class GitHubClient {
         return parseCompare(resp.body)
     }
 
-    open fun postCheckRun(
+    open fun createCheckRun(
         accessToken: String,
         repo: RepoCoords,
         request: CheckRunRequest,
         apiBase: String = DEFAULT_API_BASE,
-    ): Boolean {
+    ): CheckRunCreateResult {
         val resp = request(
             "POST",
             "$apiBase/repos/${repo.slug}/check-runs",
             accessToken,
-            encodeCheckRunPayload(request),
-        ) ?: return false
-        // 201 Created on success per GitHub Check Runs API.
-        if (resp.isSuccess) return true
-        LOG.warn("GitHub Check Run POST returned ${resp.code} for ${repo.slug}@${request.headSha}: ${resp.body}")
-        return false
+            encodeCheckRunCreatePayload(request),
+            // A lifecycle create can be looked up by external_id after an
+            // uncertain response. Retrying any create POST after a lost
+            // response could create another Check Run if GitHub accepted it.
+            retryAmbiguousFailures = false,
+        ) ?: return CheckRunCreateResult.Uncertain
+        if (resp.isSuccess) {
+            val id = runCatching { MAPPER.readTree(resp.body).path("id").asLong(-1) }.getOrDefault(-1)
+            if (id > 0) return CheckRunCreateResult.Created(id)
+            LOG.warn("GitHub Check Run POST succeeded without a parseable id for ${repo.slug}@${request.headSha}")
+            return CheckRunCreateResult.Uncertain
+        }
+        LOG.warn("GitHub Check Run POST returned ${resp.code} for ${repo.slug}@${request.headSha}")
+        return when {
+            resp.code in 500..599 -> CheckRunCreateResult.Uncertain
+            isRateLimitResponse(resp) -> CheckRunCreateResult.Rejected(resp.code, retryable = true)
+            else -> CheckRunCreateResult.Rejected(resp.code, retryable = false)
+        }
+    }
+
+    open fun updateCheckRun(
+        accessToken: String,
+        repo: RepoCoords,
+        checkRunId: Long,
+        request: CheckRunRequest,
+        apiBase: String = DEFAULT_API_BASE,
+    ): CheckRunUpdateResult {
+        val resp = request(
+            "PATCH",
+            "$apiBase/repos/${repo.slug}/check-runs/$checkRunId",
+            accessToken,
+            encodeCheckRunUpdatePayload(request),
+            // Check Run annotations are appended by GitHub. A PATCH retried
+            // after a lost response could append every annotation twice; the
+            // caller verifies the run status before retrying an uncertain one.
+            retryAmbiguousFailures = false,
+        ) ?: return CheckRunUpdateResult.Uncertain
+        if (resp.isSuccess) return CheckRunUpdateResult.Accepted
+        LOG.warn("GitHub Check Run PATCH returned ${resp.code} for ${repo.slug}#$checkRunId")
+        return if (resp.code in 500..599) CheckRunUpdateResult.Uncertain
+        else CheckRunUpdateResult.Rejected(resp.code)
+    }
+
+    open fun findCheckRunByExternalId(
+        accessToken: String,
+        repo: RepoCoords,
+        headSha: String,
+        checkName: String,
+        externalId: String,
+        apiBase: String = DEFAULT_API_BASE,
+    ): CheckRunLookup {
+        val matching = mutableListOf<CheckRunSummary>()
+        var complete = false
+        for (page in 1..MAX_CHECK_RUN_LOOKUP_PAGES) {
+            val url = "$apiBase/repos/${repo.slug}/commits/$headSha/check-runs" +
+                "?check_name=${encodeQueryParameter(checkName)}&filter=all&per_page=100&page=$page"
+            val resp = request("GET", url, accessToken) ?: return CheckRunLookup.Unavailable
+            if (!resp.isSuccess) {
+                LOG.warn("GitHub Check Run lookup returned ${resp.code} for ${repo.slug}@$headSha")
+                return CheckRunLookup.Unavailable
+            }
+            val parsed = parseCheckRunPage(resp.body) ?: return CheckRunLookup.Unavailable
+            parsed.runs.filterTo(matching) {
+                it.externalId == externalId && it.name == checkName && it.headSha == headSha
+            }
+            if (parsed.totalCount <= page * 100) {
+                complete = true
+                break
+            }
+        }
+        if (!complete) return CheckRunLookup.Unavailable
+        return when (matching.size) {
+            0 -> CheckRunLookup.NotFound
+            1 -> CheckRunLookup.Found(matching.single())
+            else -> CheckRunLookup.Ambiguous
+        }
+    }
+
+    open fun getCheckRun(
+        accessToken: String,
+        repo: RepoCoords,
+        checkRunId: Long,
+        apiBase: String = DEFAULT_API_BASE,
+    ): CheckRunSummary? {
+        val resp = request("GET", "$apiBase/repos/${repo.slug}/check-runs/$checkRunId", accessToken)
+            ?: return null
+        if (!resp.isSuccess) {
+            LOG.warn("GitHub Check Run GET returned ${resp.code} for ${repo.slug}#$checkRunId")
+            return null
+        }
+        return parseCheckRun(resp.body)
     }
 
     // GET /repos/{slug}/pulls/{n}/files -> the paths changed by the PR.
@@ -322,11 +411,12 @@ open class GitHubClient {
         urlSpec: String,
         token: String?,
         jsonBody: String? = null,
+        retryAmbiguousFailures: Boolean = true,
     ): HttpResponse? {
         var attempt = 1
         while (true) {
             val resp = executeOnce(method, urlSpec, token, jsonBody)
-            if (attempt >= maxAttempts || !isRetryable(resp)) return resp
+            if (Thread.currentThread().isInterrupted || attempt >= maxAttempts || !isRetryable(resp, retryAmbiguousFailures)) return resp
             val delay = backoffMs(attempt, resp)
             val why = resp?.let { "HTTP ${it.code}" } ?: "transport error"
             LOG.warn("GitHub $method $urlSpec: $why (attempt $attempt/$maxAttempts); retrying in ${delay}ms")
@@ -335,17 +425,22 @@ open class GitHubClient {
         }
     }
 
-    private fun isRetryable(resp: HttpResponse?): Boolean {
-        if (resp == null) return true // transport error (IOException etc.)
-        if (resp.code in 500..599) return true
+    private fun isRetryable(resp: HttpResponse?, retryAmbiguousFailures: Boolean): Boolean {
+        if (resp == null) return retryAmbiguousFailures // transport error (IOException etc.)
+        if (resp.code in 500..599) return retryAmbiguousFailures
         // Primary/secondary rate limit: GitHub returns 403 or 429 with the
         // remaining budget at 0. A plain 403 (permissions) is NOT retried.
-        if (resp.code == 403 || resp.code == 429) {
+        if (resp.code == 429) return true // an explicit rejection; safe to retry
+        if (resp.code == 403) {
             return resp.header("X-RateLimit-Remaining")?.trim() == "0" ||
                 resp.header("Retry-After") != null
         }
         return false
     }
+
+    private fun isRateLimitResponse(resp: HttpResponse): Boolean =
+        resp.code == 429 || (resp.code == 403 &&
+            (resp.header("X-RateLimit-Remaining")?.trim() == "0" || resp.header("Retry-After") != null))
 
     private fun backoffMs(attempt: Int, resp: HttpResponse?): Long {
         // Honour an explicit Retry-After (delta seconds) when present.
@@ -356,44 +451,40 @@ open class GitHubClient {
         return (baseDelayMs shl (attempt - 1)).coerceIn(0L, MAX_BACKOFF_MS)
     }
 
-    // Single home for the HttpURLConnection boilerplate every endpoint
-    // shared: common auth/accept/version headers, fixed timeouts,
-    // optional JSON body, response/error stream draining, and guaranteed
-    // disconnect. Returns null only when the call could not complete at
-    // the transport layer (IOException etc.) — an HTTP error response
-    // (4xx/5xx) still comes back as an HttpResponse so the retry layer
-    // can inspect the status and headers.
+    // Single home for the JDK HttpClient request setup shared by every
+    // endpoint: common auth/accept/version headers, fixed timeouts, optional
+    // JSON body, and full response-body handling. Returns null only when the
+    // call could not complete at the transport layer (IOException, timeout,
+    // etc.) — an HTTP error response (4xx/5xx) still comes back as an
+    // HttpResponse so the retry layer can inspect its status and headers.
     private fun executeOnce(
         method: String,
         urlSpec: String,
         token: String?,
         jsonBody: String? = null,
     ): HttpResponse? {
-        val conn = (URI.create(urlSpec).toURL().openConnection() as HttpURLConnection).apply {
-            requestMethod = method
-            if (token != null) setRequestProperty("Authorization", "Bearer $token")
-            setRequestProperty("Accept", ACCEPT_HEADER)
-            setRequestProperty("X-GitHub-Api-Version", apiVersion)
-            connectTimeout = CONNECT_TIMEOUT_MS
-            readTimeout = READ_TIMEOUT_MS
-            if (jsonBody != null) {
-                setRequestProperty("Content-Type", "application/json")
-                doOutput = true
-            }
-        }
         return try {
-            if (jsonBody != null) {
-                conn.outputStream.use { it.write(jsonBody.toByteArray(Charsets.UTF_8)) }
+            val builder = HttpRequest.newBuilder(URI.create(urlSpec))
+                .timeout(Duration.ofMillis(READ_TIMEOUT_MS.toLong()))
+                .header("Accept", ACCEPT_HEADER)
+                .header("X-GitHub-Api-Version", apiVersion)
+            if (token != null) builder.header("Authorization", "Bearer $token")
+            val body = if (jsonBody == null) {
+                HttpRequest.BodyPublishers.noBody()
+            } else {
+                builder.header("Content-Type", "application/json")
+                HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8)
             }
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-            HttpResponse(code = code, body = text, headers = conn.headerFields ?: emptyMap())
+            val request = builder.method(method, body).build()
+            val response = HTTP_CLIENT.send(request, JdkHttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
+            HttpResponse(code = response.statusCode(), body = response.body(), headers = response.headers().map())
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            LOG.warn("HTTP $method $urlSpec was interrupted")
+            null
         } catch (e: Exception) {
             LOG.warn("HTTP $method $urlSpec failed: ${e.message}")
             null
-        } finally {
-            conn.disconnect()
         }
     }
 
@@ -406,6 +497,10 @@ open class GitHubClient {
         const val ACCEPT_HEADER: String = "application/vnd.github+json"
         const val CONNECT_TIMEOUT_MS: Int = 5000
         const val READ_TIMEOUT_MS: Int = 10000
+
+        private val HTTP_CLIENT: HttpClient = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofMillis(CONNECT_TIMEOUT_MS.toLong()))
+            .build()
 
         const val DEFAULT_MAX_ATTEMPTS: Int = 3
         const val DEFAULT_BASE_DELAY_MS: Long = 500L
@@ -662,14 +757,63 @@ open class GitHubClient {
         const val MAX_ANNOTATIONS_PER_REQUEST: Int = 50
         private const val MAX_ANNOTATION_MESSAGE: Int = 64 * 1024
         private const val MAX_ANNOTATION_TITLE: Int = 255
+        private const val MAX_CHECK_RUN_LOOKUP_PAGES: Int = 10
 
-        // Public for testing — verifies we build the exact JSON shape GitHub expects.
-        // GitHub Check Runs API: when status != completed, the conclusion field
-        // must NOT be sent. Otherwise it's required.
-        fun encodeCheckRunPayload(request: CheckRunRequest): String {
+        private fun encodeQueryParameter(value: String): String =
+            java.net.URLEncoder.encode(value, Charsets.UTF_8)
+
+        private fun parseCheckRunPage(json: String): CheckRunPage? {
+            return try {
+                val root = MAPPER.readTree(json)
+                val totalCount = root.path("total_count").takeIf { it.canConvertToInt() }?.asInt() ?: return null
+                val array = root.path("check_runs").takeIf { it.isArray } ?: return null
+                val runs = array.map { parseCheckRunNode(it) ?: return null }
+                CheckRunPage(totalCount, runs)
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+        private fun parseCheckRun(json: String): CheckRunSummary? = try {
+            parseCheckRunNode(MAPPER.readTree(json))
+        } catch (_: Exception) {
+            null
+        }
+
+        private fun parseCheckRunNode(node: JsonNode): CheckRunSummary? {
+            if (!node.isObject) return null
+            val id = node.path("id").takeIf { it.canConvertToLong() }?.asLong()?.takeIf { it > 0 } ?: return null
+            val name = node.path("name").takeIf { it.isTextual }?.asText() ?: return null
+            val headSha = node.path("head_sha").takeIf { it.isTextual }?.asText() ?: return null
+            // Existing Check Runs created outside this lifecycle may omit the
+            // optional external_id. They are irrelevant to an exact lookup,
+            // but must not make the entire paginated response unreadable.
+            val externalId = node.path("external_id").takeIf { it.isTextual }?.asText()
+            val statusValue = node.path("status").takeIf { it.isTextual }?.asText() ?: return null
+            val status = CheckRunStatus.entries.firstOrNull { it.apiValue == statusValue } ?: return null
+            return CheckRunSummary(id, externalId, name, headSha, status)
+        }
+
+        // Public for testing — verifies the POST shape, including the Check
+        // Run identity fields that GitHub associates with the new run.
+        fun encodeCheckRunCreatePayload(request: CheckRunRequest): String = encodeCheckRunPayload(request, includeIdentity = true)
+
+        // A PATCH targets the already identified run, so it carries mutable
+        // status/output fields only. GitHub's update endpoint has no head_sha
+        // parameter. Although name and external_id are optional update fields,
+        // omitting them keeps the run's persisted identity fixed.
+        fun encodeCheckRunUpdatePayload(request: CheckRunRequest): String = encodeCheckRunPayload(request, includeIdentity = false)
+
+        // Kept as a creation-payload alias for existing callers and tests.
+        fun encodeCheckRunPayload(request: CheckRunRequest): String = encodeCheckRunCreatePayload(request)
+
+        private fun encodeCheckRunPayload(request: CheckRunRequest, includeIdentity: Boolean): String {
             val root: ObjectNode = MAPPER.createObjectNode()
-            root.put("name", request.name)
-            root.put("head_sha", request.headSha)
+            if (includeIdentity) {
+                root.put("name", request.name)
+                root.put("head_sha", request.headSha)
+                request.externalId?.let { root.put("external_id", it) }
+            }
             root.put("status", request.status.apiValue)
             if (request.status == CheckRunStatus.COMPLETED) {
                 val conclusion = request.conclusion
@@ -707,6 +851,35 @@ open class GitHubClient {
     }
 }
 
+sealed interface CheckRunCreateResult {
+    data class Created(val checkRunId: Long) : CheckRunCreateResult
+    data class Rejected(val statusCode: Int, val retryable: Boolean) : CheckRunCreateResult
+    object Uncertain : CheckRunCreateResult
+}
+
+sealed interface CheckRunUpdateResult {
+    object Accepted : CheckRunUpdateResult
+    data class Rejected(val statusCode: Int) : CheckRunUpdateResult
+    object Uncertain : CheckRunUpdateResult
+}
+
+data class CheckRunSummary(
+    val id: Long,
+    val externalId: String?,
+    val name: String,
+    val headSha: String,
+    val status: CheckRunStatus,
+)
+
+data class CheckRunPage(val totalCount: Int, val runs: List<CheckRunSummary>)
+
+sealed interface CheckRunLookup {
+    data class Found(val checkRun: CheckRunSummary) : CheckRunLookup
+    object NotFound : CheckRunLookup
+    object Ambiguous : CheckRunLookup
+    object Unavailable : CheckRunLookup
+}
+
 // Transport-level result of a single GitHub HTTP call. `body` holds the
 // response text (the input stream on 2xx, the error stream otherwise);
 // `headers` is the raw header map, used to read rate-limit signals.
@@ -717,10 +890,8 @@ data class HttpResponse(
 ) {
     val isSuccess: Boolean get() = code in 200..299
 
-    // `name.equals(it.key, …)` (not `it.key.equals(name)`) because the
-    // raw header map can carry a null key — Java's HttpURLConnection
-    // stores the status line under one — and calling through `name`
-    // tolerates it.
+    // Call equals through the non-null lookup name so an unusual raw header
+    // map with a null key remains safe to inspect.
     fun header(name: String): String? =
         headers.entries.firstOrNull { name.equals(it.key, ignoreCase = true) }
             ?.value?.firstOrNull()
@@ -754,6 +925,9 @@ data class CheckRunRequest(
     // look like a build that took no time at all.
     val startedAt: String? = null,
     val completedAt: String? = null,
+    // Sent on lifecycle creates so a response lost in transit can be resolved
+    // without posting a second Check Run.
+    val externalId: String? = null,
 )
 
 // One GitHub Check Run annotation: a diagnostic pinned to a repo-relative

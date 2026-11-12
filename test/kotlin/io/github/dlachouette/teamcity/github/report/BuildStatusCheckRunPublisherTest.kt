@@ -1,6 +1,7 @@
 package io.github.dlachouette.teamcity.github.report
 
 import io.github.dlachouette.teamcity.github.api.CheckRunConclusion
+import io.github.dlachouette.teamcity.github.api.CheckRunStatus
 import io.github.dlachouette.teamcity.github.testsupport.LoggerBootstrap
 import jetbrains.buildServer.messages.Status
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -199,18 +200,30 @@ class BuildStatusCheckRunPublisherTest {
         )
     }
 
-    // A build leaving the queue to run: its own buildStarted / buildFinished
-    // own the row, whether it is this promotion's build or an equivalent one.
+    // This promotion's own start is handled by lifecycle events; a replacement waits for its outcome.
     @Test
     fun `a build that left the queue to run is left to its lifecycle events`() {
-        for (own in listOf(true, false)) {
-            assertEquals(
-                QueueRemovalAction.LIFECYCLE_OWNS_ROW,
-                BuildStatusCheckRunPublisher.decideQueueRemoval(
-                    associatedPresent = true, associatedFinished = false, associatedIsOwn = own, removedByUser = false,
-                ),
-            )
-        }
+        assertEquals(
+            QueueRemovalAction.LIFECYCLE_OWNS_ROW,
+            BuildStatusCheckRunPublisher.decideQueueRemoval(
+                associatedPresent = true, associatedFinished = false, associatedIsOwn = true, removedByUser = false,
+            ),
+        )
+        assertEquals(
+            QueueRemovalAction.WAIT_FOR_EQUIVALENT_BUILD,
+            BuildStatusCheckRunPublisher.decideQueueRemoval(
+                associatedPresent = true, associatedFinished = false, associatedIsOwn = false, removedByUser = false,
+            ),
+        )
+        assertEquals(
+            ReconcileAction.WAIT,
+            BuildStatusCheckRunPublisher.decideReconcile(
+                ageMs = BuildStatusCheckRunPublisher.MAX_OPEN_AGE_MS + 1,
+                stillQueued = false,
+                associatedPresent = true,
+                associatedFinished = false,
+            ),
+        )
     }
 
     @Test
@@ -234,6 +247,7 @@ class BuildStatusCheckRunPublisherTest {
                 QueueRemovalAction.REPORT_EQUIVALENT_OUTCOME,
                 BuildStatusCheckRunPublisher.decideQueueRemoval(
                     associatedPresent = true, associatedFinished = true, associatedIsOwn = false, removedByUser = byUser,
+                    associatedIdentityMatches = true,
                 ),
             )
         }
@@ -249,14 +263,36 @@ class BuildStatusCheckRunPublisherTest {
         )
     }
 
-    // A system teardown of a duplicate promotion: the real build reports for itself,
-    // and a generic status here would clobber its result.
+    // Removal alone is not evidence that an equivalent build passed; reconcile its outcome.
     @Test
-    fun `a system removal with no build stays silent`() {
+    fun `a system removal with no build waits for reconciliation`() {
         assertEquals(
-            QueueRemovalAction.IGNORE,
+            QueueRemovalAction.DEFER_FOR_RECONCILIATION,
             BuildStatusCheckRunPublisher.decideQueueRemoval(
                 associatedPresent = false, associatedFinished = false, associatedIsOwn = false, removedByUser = false,
+            ),
+        )
+        assertEquals(
+            ReconcileAction.PUBLISH_LATEST_ON_COMMIT,
+            BuildStatusCheckRunPublisher.decideReconcile(
+                ageMs = BuildStatusCheckRunPublisher.RECONCILE_GRACE_MS,
+                stillQueued = false,
+                associatedPresent = false,
+                associatedFinished = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `a finished unrelated promotion cannot satisfy the removed check`() {
+        assertEquals(
+            QueueRemovalAction.DEFER_FOR_RECONCILIATION,
+            BuildStatusCheckRunPublisher.decideQueueRemoval(
+                associatedPresent = true,
+                associatedFinished = true,
+                associatedIsOwn = false,
+                removedByUser = false,
+                associatedIdentityMatches = false,
             ),
         )
     }
@@ -360,7 +396,7 @@ class BuildStatusCheckRunPublisherTest {
             QueueRemovalAction.REPORT_EQUIVALENT_OUTCOME,
             BuildStatusCheckRunPublisher.decideQueueRemoval(
                 associatedPresent = true, associatedFinished = true, associatedIsOwn = false,
-                removedByUser = false, queuedRowWithheld = true,
+                removedByUser = false, associatedIdentityMatches = true, queuedRowWithheld = true,
             ),
         )
         assertEquals(
@@ -405,5 +441,41 @@ class BuildStatusCheckRunPublisherTest {
         assertEquals(ReconcileAction.PUBLISH_BUILD, decide(present = true, finished = true))
         assertEquals(ReconcileAction.PUBLISH_LATEST_ON_COMMIT, decide())
         assertEquals(ReconcileAction.EXPIRE, decide(age = BuildStatusCheckRunPublisher.MAX_OPEN_AGE_MS + 1, queued = true))
+        assertEquals(
+            ReconcileAction.WAIT,
+            decide(age = BuildStatusCheckRunPublisher.MAX_OPEN_AGE_MS + 1, present = true, finished = false),
+            "a long running build keeps its run open for its own completion callback",
+        )
+    }
+
+    @Test
+    fun `reconciliation resumes only a safely retryable queued reservation`() {
+        val reserved = OpenCheckRunRegistry.Entry(
+            promotionId = 42,
+            buildTypeExternalId = "build",
+            headSha = "sha123",
+            openedAt = 1L,
+            repoSlug = "owner/repo",
+            checkName = "Build",
+            externalId = "tcgh:test:42",
+            desiredStatus = CheckRunStatus.QUEUED,
+            createPhase = CheckRunCreatePhase.RESERVED,
+        )
+        fun shouldResume(
+            entry: OpenCheckRunRegistry.Entry = reserved,
+            action: ReconcileAction = ReconcileAction.WAIT,
+            queued: Boolean = true,
+            associated: Boolean = false,
+        ) = BuildStatusCheckRunPublisher.shouldResumeQueuedReservation(entry, action, queued, associated)
+
+        assertTrue(shouldResume())
+        assertTrue(shouldResume(reserved.copy(createPhase = CheckRunCreatePhase.RETRYABLE)))
+        listOf(CheckRunCreatePhase.POSTING, CheckRunCreatePhase.UNCERTAIN, CheckRunCreatePhase.REJECTED, CheckRunCreatePhase.LEGACY)
+            .forEach { assertFalse(shouldResume(reserved.copy(createPhase = it))) }
+        assertFalse(shouldResume(reserved.copy(checkRunId = 456L)))
+        assertFalse(shouldResume(reserved.copy(desiredStatus = CheckRunStatus.COMPLETED)))
+        assertFalse(shouldResume(action = ReconcileAction.EXPIRE))
+        assertFalse(shouldResume(queued = false))
+        assertFalse(shouldResume(associated = true))
     }
 }

@@ -5,9 +5,9 @@ import org.junit.jupiter.api.Test
 
 class ReportHelpersTest {
 
-    // Shortening the Check Run name is a **rename**: GitHub keys a row on
-    // (name, head_sha) and a branch protection rule requires the string
-    // literally. So the stripping is deliberately timid.
+    // Shortening the Check Run name is a **rename**: a branch protection rule
+    // requires the context name literally. So the stripping is deliberately
+    // timid.
 
     private val full = "TeamCity / Sandbox / test_ci / PR / Build / Linux / Build (Linux, x64, Release)"
 

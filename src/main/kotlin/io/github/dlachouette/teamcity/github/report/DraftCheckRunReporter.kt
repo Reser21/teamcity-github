@@ -2,6 +2,7 @@ package io.github.dlachouette.teamcity.github.report
 
 import com.intellij.openapi.diagnostic.Logger
 import io.github.dlachouette.teamcity.github.api.CheckRunConclusion
+import io.github.dlachouette.teamcity.github.api.CheckRunCreateResult
 import io.github.dlachouette.teamcity.github.api.CheckRunRequest
 import io.github.dlachouette.teamcity.github.api.CheckRunStatus
 import io.github.dlachouette.teamcity.github.api.GitHubClient
@@ -69,7 +70,7 @@ class DraftCheckRunReporter(
         val dedupKey = headSha to buildType.externalId
         if (!published.add(dedupKey)) return false
 
-        val ok = gitHubClient.postCheckRun(access.token, config.repo, request, access.apiBase)
+        val ok = gitHubClient.createCheckRun(access.token, config.repo, request, access.apiBase) is CheckRunCreateResult.Created
         if (!ok) {
             published.remove(dedupKey)
             LOG.warn("Skipped Check Run POST failed for ${config.repo.slug}@$headSha (${buildType.externalId})")
@@ -79,10 +80,9 @@ class DraftCheckRunReporter(
         return ok
     }
 
-    // Republish the success of a build that already covered this commit, for
-    // a queued build that was dropped as redundant. Same Check Run name and
-    // same commit as the original build, so GitHub updates that one row; the
-    // details link points at the build that actually ran.
+    // Report the success reused for a queued build that was dropped as
+    // redundant. The Check Run is attached to the queued promotion's commit;
+    // its details link points at the build that actually ran.
     fun postReusedSuccess(
         buildType: SBuildType,
         config: BridgeFeatureConfig,
@@ -107,7 +107,7 @@ class DraftCheckRunReporter(
                 "the queued build was dropped instead of reproducing a known result.",
             detailsUrl = safeUrl { webLinks.getViewResultsUrl(reused) },
         )
-        val ok = gitHubClient.postCheckRun(access.token, config.repo, request, access.apiBase)
+        val ok = gitHubClient.createCheckRun(access.token, config.repo, request, access.apiBase) is CheckRunCreateResult.Created
         if (ok) LOG.info("Republished success of #${reused.buildNumber} for ${config.repo.slug}@$headSha (${buildType.externalId})")
         else LOG.warn("Reused-success Check Run POST failed for ${config.repo.slug}@$headSha (${buildType.externalId})")
         return ok

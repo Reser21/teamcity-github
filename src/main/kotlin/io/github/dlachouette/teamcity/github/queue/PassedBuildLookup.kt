@@ -9,10 +9,10 @@ import jetbrains.buildServer.serverSide.SFinishedBuild
 // queued duplicate) and the Check Run publisher (a chain's duplicate must not
 // turn that green row back to "Queued").
 //
-// Same build configuration, same commit, any ref: GitHub keys a Check Run on
-// (name, sha), so two refs of one commit are one row anyway. A personal build
-// is never that evidence: it passed on a patch that is not in the repository,
-// and it published nothing.
+// Same build configuration and commit, any ref: reuse the passed result for a
+// queued duplicate rather than letting it regress to "Queued". Each promotion
+// still owns its own GitHub Check Run. A personal build is never that evidence:
+// it passed on a patch that is not in the repository, and it published nothing.
 object PassedBuildLookup {
 
     // How far back to look for a successful build of the same commit.
