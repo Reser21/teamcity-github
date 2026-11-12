@@ -33,7 +33,7 @@ flowchart TB
         TR[TokenResolver<br/>self-mint primary]:::logic
         ATM[AppTokenMinter<br/>JWT + installation token]:::logic
         ATC[AppTokenCache<br/>per-installation TTL]:::cache
-        GC[GitHubClient<br/>REST + Jackson<br/>getPr / postCheckRun /<br/>listInstallations / mintToken]:::io
+        GC[GitHubClient<br/>REST + Jackson<br/>createCheckRun / updateCheckRun /<br/>listInstallations / mintToken]:::io
         PIC[PrInfoCache<br/>TTL 60s]:::cache
         REL[RecentEventsLog<br/>ring buffer N=100]:::cache
 
@@ -115,7 +115,7 @@ io.github.dlachouette.teamcity.github
 ├── TeamCityGitHubBridgePlugin       main lifecycle bean
 ├── api/
 │   ├── GitHubClient                 open class, HTTP + Jackson: getPr, prsForCommit, listPrFiles,
-│   │                                compare, postCheckRun, addAssignee, addLabels, isTeamMember,
+│   │                                compare, createCheckRun, updateCheckRun, addAssignee, addLabels, isTeamMember,
 │   │                                branch protection / rulesets, installations, tokens
 │   ├── PrInfoCache                  TTL-based, ConcurrentHashMap over the calls above
 │   ├── PrInfo, RepoCoords           PR snapshot (draft, head sha/ref, head repo, title, body,

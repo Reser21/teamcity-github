@@ -57,6 +57,28 @@ class CheckRunPayloadTest {
     }
 
     @Test
+    fun `update payload contains mutable fields but no create identity fields`() {
+        val request = CheckRunRequest(
+            name = "TeamCity / Build",
+            headSha = "deadbeef",
+            status = CheckRunStatus.COMPLETED,
+            conclusion = CheckRunConclusion.CANCELLED,
+            outputTitle = "Cancelled",
+            outputSummary = "The queued build was removed.",
+            externalId = "tcgh:v2:identity",
+        )
+
+        val node = mapper.readTree(GitHubClient.encodeCheckRunUpdatePayload(request))
+
+        assertTrue(node.path("name").isMissingNode)
+        assertTrue(node.path("head_sha").isMissingNode)
+        assertTrue(node.path("external_id").isMissingNode)
+        assertEquals("completed", node.path("status").asText())
+        assertEquals("cancelled", node.path("conclusion").asText())
+        assertEquals("Cancelled", node.path("output").path("title").asText())
+    }
+
+    @Test
     fun `emits queued status without conclusion`() {
         val request = CheckRunRequest(
             name = "TeamCity / Build",

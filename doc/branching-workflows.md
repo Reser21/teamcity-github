@@ -951,9 +951,8 @@ configurations whose last build at that commit failed.
 
 By default a PR build runs on the synthetic **`pull/N`** ref: TeamCity's
 Branch column shows `pull/189`, and a work branch that also has a VCS trigger
-builds **twice** per push — once as the branch, once as `pull/N` — with both
-builds fighting over the same Check Run row, which GitHub keys on
-`(name, commit)`.
+builds **twice** per push — once as the branch, once as `pull/N` — producing
+separate Check Runs with the same name and commit.
 
 Tick **Build PRs on their own branch** on the project
 (`teamcity.github.bridge.prBuildRef = branch`) and the bridge enqueues PR
@@ -1015,14 +1014,15 @@ history as builds of a ref that stops receiving new ones. Full reference in
 | cascade PR | `pull_request.opened` (bot) | bridge listener | A1, A2, A10 | same as a human PR |
 | QA deploy | comment / API / manual | bridge or API | A8 | Check Run on the built SHA |
 | QA verdict | inline comment `/qa-ok` | bridge listener | A9 | `QA_Signoff` Check Run — **reference pattern only**, not used here (R15) |
-| red **or green** check, re-run | `check_run.rerequested` | bridge listener | the same BT | fresh row, same SHA (works today, F27) |
+| red **or green** check, re-run | `check_run.rerequested` | bridge listener | the same BT | new promotion and Check Run id on the same SHA (works today, F27) |
 | **skipped** check, re-run | `check_run.rerequested` | bridge listener | the same BT | the build runs: an explicit request bypasses the filters that skipped it |
 | **re-run all** | `check_suite.rerequested` | bridge listener | every opted-in BT at that head | whole check set re-runs (optionally only the failed ones) |
 | PR from a **fork** | any PR event | nobody — event dropped | — | nothing runs, nothing is reported |
 
 > Every `pull/N` in this table is "the ref carrying the PR build". In
-> branch-source mode (F28) that ref is the head branch itself, and the first
-> row merges into the PR rows — same build, same Check Run, readable name.
+> branch-source mode (F28) that ref is the head branch itself, so the build
+> reports against the PR's head SHA. Each TeamCity promotion still has its own
+> Check Run id.
 
 ---
 

@@ -668,7 +668,7 @@ The button (admin page, tab **Overview**) runs the full self-test battery
 8. **Required checks / `<repo>`** (1.11.0+) - one row per repository with a token: the check names required on the default branch and on every protected branch (first 20) — rulesets, and classic protection when the App has **Administration: read** — compared with the names the bridge posts there. `WARN` lists the required names nothing posts (a pull request waits on them for ever, unless another system posts them); the detail also names posted checks no branch requires. `SKIP` when the App can read neither source.
 9. **Single status publisher** - opted-in build configurations that also carry TeamCity's bundled *Commit status publisher* (two competing rows per build on GitHub).
 10. **Draft setting along composite chains** (1.11.0+) - composites that run on drafts while an opted-in configuration in their snapshot chain, walked transitively, skips them: the composite builds that dependency on every draft push anyway, and its `Skipped: draft PR` row never appears.
-11. **Unique check names** (1.11.0+) - Check Run names that several publishing configurations post to the same repository (a copied `checkName`, or a `checkName.stripPrefix` leaving two names equal): they overwrite each other's row on every shared commit.
+11. **Unique check names** (1.11.0+) - Check Run names that several publishing configurations post to the same repository (a copied `checkName`, or a `checkName.stripPrefix` leaving two names equal): they create separate runs with indistinguishable contexts for branch protection.
 
 Configuration checks (8–11) report `WARN`, never `FAIL`: the plugin works,
 and what to change is the operator's call.

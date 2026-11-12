@@ -9,6 +9,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - An automatic build held in the queue by a scope filter (a nightly on a draft pull request) is now removed and reported "Skipped" instead of waiting for ever: the cleanup runs again once TeamCity has bound the build's revision.
+- Removing a queued promotion without an observed build outcome no longer completes its Check Run as `skipped`. The row waits for a matching build result, or is concluded as cancelled when reconciliation finds no matching build.
 
 ## [1.11.0] - 2026-10-06
 
