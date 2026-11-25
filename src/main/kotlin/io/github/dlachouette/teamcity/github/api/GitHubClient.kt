@@ -99,6 +99,7 @@ open class GitHubClient {
         return when {
             resp.code in 500..599 -> CheckRunCreateResult.Uncertain
             isRateLimitResponse(resp) -> CheckRunCreateResult.Rejected(resp.code, retryable = true)
+            resp.code == 401 || resp.code == 403 -> CheckRunCreateResult.Rejected(resp.code, retryable = true)
             else -> CheckRunCreateResult.Rejected(resp.code, retryable = false)
         }
     }

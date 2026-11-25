@@ -9,7 +9,7 @@ import io.github.dlachouette.teamcity.github.feature.BridgeTrigger
 import io.github.dlachouette.teamcity.github.feature.GateContext
 import io.github.dlachouette.teamcity.github.feature.GateContextResolver
 import io.github.dlachouette.teamcity.github.feature.GateDecision
-import io.github.dlachouette.teamcity.github.report.DraftCheckRunReporter
+import io.github.dlachouette.teamcity.github.report.BuildStatusCheckRunPublisher
 import io.github.dlachouette.teamcity.github.report.SkipReason
 import jetbrains.buildServer.serverSide.BuildServerAdapter
 import jetbrains.buildServer.serverSide.SBuildServer
@@ -36,7 +36,7 @@ import java.util.concurrent.ConcurrentHashMap
 class DraftBuildQueueCleaner(
     buildServer: SBuildServer,
     private val gateContextResolver: GateContextResolver,
-    private val checkRunReporter: DraftCheckRunReporter,
+    private val checkRunPublisher: BuildStatusCheckRunPublisher,
     private val serverSettings: BridgeServerSettings,
     private val executorServices: ExecutorServices,
 ) : BuildServerAdapter() {
@@ -118,38 +118,39 @@ class DraftBuildQueueCleaner(
             GateDecision.SUPPRESS_HARD, GateDecision.ALLOW -> error("unreachable")
         }
 
-        try {
-            queuedBuild.removeFromQueue(null, reason)
-            LOG.info("Removed ${buildType.externalId} from queue (${ctx.branchName}): $reason")
-        } catch (e: Exception) {
-            LOG.warn("removeFromQueue threw for ${buildType.externalId} (${ctx.branchName}): ${e.message}. " +
-                "The DraftAwareBuildFilter safety net will hold the build instead.", e)
-            return
-        }
-
         // Post the user-visible Skipped Check Run for PR contexts only.
         // SUPPRESS_HARD on PR is silent by design (the BT just doesn't
         // participate in PRs at all; a CR would be noise).
-        val prNumber = ctx.prNumber ?: return
+        val prNumber = ctx.prNumber
         val skipReason = when (decision) {
             GateDecision.SUPPRESS_DRAFT -> SkipReason.DRAFT_PR
             GateDecision.SUPPRESS_BRANCH_PR -> SkipReason.BRANCH_FILTER
             GateDecision.SUPPRESS_METADATA -> SkipReason.METADATA_FILTER
-            else -> return
+            else -> null
         }
         val headSha = promotion.revisions.firstOrNull()?.revision.orEmpty()
-        if (headSha.isBlank()) return
         try {
-            checkRunReporter.postSkippedCheckRun(
-                buildType = buildType,
-                config = config,
-                prNumber = prNumber,
-                headSha = headSha,
-                reason = skipReason,
-                headRef = ctx.pr?.headRef,
-            )
+            val removed = if (headSha.isBlank() || prNumber == null || skipReason == null) {
+                queuedBuild.removeFromQueue(null, reason)
+                true
+            } else {
+                checkRunPublisher.removeQueuedPromotionWithSkippedOutcome(
+                    promotionId = promotion.id,
+                    buildType = buildType,
+                    config = config,
+                    prNumber = prNumber,
+                    headSha = headSha,
+                    reason = skipReason,
+                    headRef = ctx.pr?.headRef,
+                    removeFromQueue = { queuedBuild.removeFromQueue(null, reason) },
+                    removalVerified = { removalCompletedBeforeOwnBuild(promotion) },
+                )
+            }
+            if (!removed) return
+            LOG.info("Removed ${buildType.externalId} from queue (${ctx.branchName}): $reason")
         } catch (e: Exception) {
-            LOG.warn("Failed posting Skipped (${skipReason.name}) for ${buildType.externalId}: ${e.message}")
+            LOG.warn("Queue removal failed for ${buildType.externalId} (${ctx.branchName}): ${e.message}. " +
+                "The DraftAwareBuildFilter safety net will hold the build instead.", e)
         }
     }
 
@@ -170,17 +171,23 @@ class DraftBuildQueueCleaner(
         val passed = PassedBuildLookup.find(buildType, headSha, promotion.associatedBuildId) ?: return
 
         try {
-            queuedBuild.removeFromQueue(
-                null,
-                "teamcity-github-bridge: commit $headSha already passed in #${passed.buildNumber}",
+            val reason = "teamcity-github-bridge: commit $headSha already passed in #${passed.buildNumber}"
+            val removed = checkRunPublisher.removeQueuedPromotionWithReusedSuccess(
+                promotionId = promotion.id,
+                buildType = buildType,
+                config = config,
+                headSha = headSha,
+                reusedBuild = passed,
+                removeFromQueue = { queuedBuild.removeFromQueue(null, reason) },
+                removalVerified = { removalCompletedBeforeOwnBuild(promotion) },
             )
+            if (!removed) return
+            LOG.info("Removed ${buildType.externalId} from queue (${ctx.branchName}): " +
+                "commit $headSha already passed in #${passed.buildNumber}")
         } catch (e: Exception) {
             LOG.warn("removeFromQueue threw for ${buildType.externalId} (reuse of #${passed.buildNumber}): ${e.message}")
             return
         }
-        LOG.info("Removed ${buildType.externalId} from queue (${ctx.branchName}): " +
-            "commit $headSha already passed in #${passed.buildNumber}")
-        checkRunReporter.postReusedSuccess(buildType, config, headSha, passed)
     }
 
     companion object {
@@ -190,6 +197,12 @@ class DraftBuildQueueCleaner(
         // that started or left the queue in the meantime is no longer ours to
         // remove.
         fun stillQueued(inQueue: Boolean, started: Boolean): Boolean = inQueue && !started
+
+        private fun removalCompletedBeforeOwnBuild(promotion: jetbrains.buildServer.serverSide.BuildPromotion): Boolean {
+            if (promotion.queuedBuild != null) return false
+            val associated = promotion.associatedBuild ?: return true
+            return associated.buildPromotion.id != promotion.id || associated.isFinished
+        }
     }
 }
 

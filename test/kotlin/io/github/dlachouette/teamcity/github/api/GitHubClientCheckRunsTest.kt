@@ -64,6 +64,22 @@ class GitHubClientCheckRunsTest {
     }
 
     @Test
+    fun `authentication rejections can recover while other client errors stay permanent`() {
+        listOf(401, 403).forEach { status ->
+            val client = StubClient().apply { respond = { HttpResponse(status, "{}", emptyMap()) } }
+            assertEquals(
+                CheckRunCreateResult.Rejected(status, retryable = true),
+                client.createCheckRun("token", repo, request(CheckRunStatus.QUEUED)),
+            )
+        }
+        val validation = StubClient().apply { respond = { HttpResponse(422, "{}", emptyMap()) } }
+        assertEquals(
+            CheckRunCreateResult.Rejected(422, retryable = false),
+            validation.createCheckRun("token", repo, request(CheckRunStatus.QUEUED)),
+        )
+    }
+
+    @Test
     fun `update patches the exact run id and omits create identity fields`(){
         val client = StubClient().apply { respond = { HttpResponse(200, "{}", emptyMap()) } }
         val request = request(CheckRunStatus.COMPLETED).copy(externalId = "tcgh:3:hash")

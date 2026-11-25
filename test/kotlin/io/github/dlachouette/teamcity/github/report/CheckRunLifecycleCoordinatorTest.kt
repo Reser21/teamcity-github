@@ -53,7 +53,8 @@ class CheckRunLifecycleCoordinatorTest {
     @Test
     fun `duplicate queue callbacks remain on the same id and a duplicate completion does not append annotations again`(@TempDir tmp: Path) {
         val fake = FakeGitHubClient()
-        val coordinator = CheckRunLifecycleCoordinator(OpenCheckRunRegistry(tmp.resolve("runs.tsv").toFile()), fake)
+        val registry = OpenCheckRunRegistry(tmp.resolve("runs.tsv").toFile())
+        val coordinator = CheckRunLifecycleCoordinator(registry, fake)
         val identity = identity(42)
         val queued = request(CheckRunStatus.QUEUED, "Queued")
         val completed = request(CheckRunStatus.COMPLETED, "Failed", CheckRunConclusion.FAILURE)
@@ -173,6 +174,233 @@ class CheckRunLifecycleCoordinatorTest {
         fake.createHandler = { CheckRunCreateResult.Created(813) }
         assertTrue(coordinator.publish(identity, "token", repo, request(CheckRunStatus.QUEUED, "Queued"), "api", "queued retry"))
         assertEquals(2, fake.creates.size)
+    }
+
+    @Test
+    fun `authentication rejection recovers a queued create after exact lookup`(@TempDir tmp: Path) {
+        val fake = FakeGitHubClient()
+        var rejectFirst = true
+        fake.createHandler = {
+            if (rejectFirst) {
+                rejectFirst = false
+                CheckRunCreateResult.Rejected(403, retryable = true)
+            } else {
+                CheckRunCreateResult.Created(820)
+            }
+        }
+        val registry = OpenCheckRunRegistry(tmp.resolve("runs.tsv").toFile())
+        val coordinator = CheckRunLifecycleCoordinator(registry, fake)
+        val identity = identity(65)
+        val queued = request(CheckRunStatus.QUEUED, "Queued")
+
+        assertFalse(coordinator.publish(identity, "token", repo, queued, "api", "queued while unauthorized"))
+        assertEquals(CheckRunCreatePhase.RETRYABLE, registry.entry(identity.promotionId)?.createPhase)
+        assertTrue(coordinator.publish(identity, "restored-token", repo, queued, "api", "queued after authorization"))
+
+        assertEquals(2, fake.lookups.size, "each create attempt follows an exact external_id lookup")
+        assertEquals(2, fake.creates.size, "the first POST was explicitly rejected; the second is the only accepted create")
+        assertEquals(listOf(820L), fake.createdIds)
+        assertEquals(CheckRunStatus.QUEUED, fake.creates.last().status)
+    }
+
+    @Test
+    fun `authentication rejection recovers a terminal create with its original outcome`(@TempDir tmp: Path) {
+        val fake = FakeGitHubClient()
+        var rejectFirst = true
+        fake.createHandler = { _ ->
+            if (rejectFirst) {
+                rejectFirst = false
+                CheckRunCreateResult.Rejected(401, retryable = true)
+            } else {
+                CheckRunCreateResult.Created(821)
+            }
+        }
+        val registry = OpenCheckRunRegistry(tmp.resolve("runs.tsv").toFile())
+        val coordinator = CheckRunLifecycleCoordinator(registry, fake)
+        val identity = identity(66)
+        val terminal = request(CheckRunStatus.COMPLETED, "Passed", CheckRunConclusion.SUCCESS)
+
+        assertFalse(coordinator.publish(identity, "token", repo, terminal, "api", "terminal while unauthorized"))
+        assertTrue(coordinator.publish(identity, "restored-token", repo, terminal, "api", "terminal after authorization"))
+
+        assertEquals(2, fake.lookups.size)
+        assertEquals(2, fake.creates.size)
+        assertEquals(listOf(821L), fake.createdIds)
+        assertEquals(CheckRunStatus.COMPLETED, fake.creates.last().status)
+        assertEquals(CheckRunConclusion.SUCCESS, fake.creates.last().conclusion)
+        assertEquals(CheckRunCreatePhase.COMPLETED, registry.entry(identity.promotionId)?.createPhase)
+    }
+
+    @Test
+    fun `permanent validation rejection is not replayed after a later event`(@TempDir tmp: Path) {
+        val fake = FakeGitHubClient().apply {
+            createHandler = { CheckRunCreateResult.Rejected(422, retryable = false) }
+        }
+        val registry = OpenCheckRunRegistry(tmp.resolve("runs.tsv").toFile())
+        val coordinator = CheckRunLifecycleCoordinator(registry, fake)
+        val identity = identity(67)
+        val queued = request(CheckRunStatus.QUEUED, "Queued")
+
+        assertFalse(coordinator.publish(identity, "token", repo, queued, "api", "invalid create"))
+        fake.createHandler = { CheckRunCreateResult.Created(822) }
+        assertFalse(coordinator.publish(identity, "token", repo, queued, "api", "later callback"))
+
+        assertEquals(CheckRunCreatePhase.REJECTED, registry.entry(identity.promotionId)?.createPhase)
+        assertEquals(1, fake.creates.size)
+        assertTrue(fake.createdIds.isEmpty())
+    }
+
+    @Test
+    fun `policy skip is durable before removal and late callbacks cannot create a cancelled run`(@TempDir tmp: Path) {
+        val fake = FakeGitHubClient()
+        val registry = OpenCheckRunRegistry(tmp.resolve("runs.tsv").toFile())
+        val coordinator = CheckRunLifecycleCoordinator(registry, fake)
+        val identity = identity(68)
+        val outcome = skippedPolicyOutcome()
+        val queued = request(CheckRunStatus.QUEUED, "Queued")
+        val cancelled = request(CheckRunStatus.COMPLETED, "Cancelled", CheckRunConclusion.CANCELLED)
+        var queueRemoved = false
+
+        assertTrue(
+            coordinator.removeWithPolicyOutcome(identity, outcome, "token", repo, "api", "filtered skip") {
+                val prepared = registry.entry(identity.promotionId)!!
+                assertEquals(CheckRunCreatePhase.POLICY_PENDING, prepared.createPhase)
+                assertEquals(false, prepared.policyOutcome?.committed)
+                assertFalse(coordinator.publish(identity, "token", repo, queued, "api", "late queued callback"))
+                assertTrue(coordinator.deferUntilOutcome(identity))
+                queueRemoved = true
+            },
+        )
+
+        assertTrue(queueRemoved)
+        assertEquals(1, fake.creates.size)
+        assertEquals(CheckRunStatus.COMPLETED, fake.creates.single().status)
+        assertEquals(CheckRunConclusion.SKIPPED, fake.creates.single().conclusion)
+        assertEquals("Skipped: draft PR", fake.creates.single().outputTitle)
+        assertFalse(coordinator.publish(identity, "token", repo, cancelled, "api", "late cancellation"))
+        assertFalse(coordinator.publish(identity, "token", repo, queued, "api", "late queue event"))
+        assertEquals(1, fake.creates.size)
+        assertTrue(fake.updates.isEmpty())
+        assertEquals(CheckRunCreatePhase.COMPLETED, registry.entry(identity.promotionId)?.createPhase)
+    }
+
+    @Test
+    fun `prepared policy result survives restart between removal and publication`(@TempDir tmp: Path) {
+        val file = tmp.resolve("runs.tsv").toFile()
+        val originalRegistry = OpenCheckRunRegistry(file)
+        val original = CheckRunLifecycleCoordinator(originalRegistry, FakeGitHubClient())
+        val identity = identity(69)
+        val outcome = skippedPolicyOutcome()
+
+        assertTrue(original.preparePolicyOutcome(identity, outcome))
+        assertTrue(original.deferUntilOutcome(identity))
+        assertEquals(CheckRunCreatePhase.POLICY_PENDING, originalRegistry.entry(identity.promotionId)?.createPhase)
+
+        val recoveredRegistry = OpenCheckRunRegistry(file).also { assertTrue(it.load()) }
+        val remote = FakeGitHubClient()
+        val recovered = CheckRunLifecycleCoordinator(recoveredRegistry, remote)
+        assertTrue(recovered.commitPolicyOutcome(identity, "token", repo, "api", "policy-outcome/reconciliation"))
+
+        assertEquals(1, remote.creates.size)
+        assertEquals(CheckRunConclusion.SKIPPED, remote.creates.single().conclusion)
+        assertEquals("Skipped: draft PR", remote.creates.single().outputTitle)
+        assertEquals(CheckRunCreatePhase.COMPLETED, recoveredRegistry.entry(identity.promotionId)?.createPhase)
+        assertTrue(recoveredRegistry.entry(identity.promotionId)?.policyOutcome?.committed == true)
+    }
+
+    @Test
+    fun `verified reuse is stored and produces one authoritative success run`(@TempDir tmp: Path) {
+        val fake = FakeGitHubClient()
+        val file = tmp.resolve("runs.tsv").toFile()
+        val registry = OpenCheckRunRegistry(file)
+        val coordinator = CheckRunLifecycleCoordinator(registry, fake)
+        val identity = identity(70)
+        val outcome = reusedPolicyOutcome()
+
+        assertTrue(coordinator.removeWithPolicyOutcome(identity, outcome, "token", repo, "api", "reused success") {})
+        val stored = registry.entry(identity.promotionId)?.policyOutcome
+        assertEquals(PolicyOutcomeKind.REUSED_SUCCESS, stored?.kind)
+        assertEquals(9876L, stored?.verifiedBuildId)
+        assertEquals("#123", stored?.verifiedBuildNumber)
+        assertEquals(1, fake.creates.size)
+        assertEquals(CheckRunConclusion.SUCCESS, fake.creates.single().conclusion)
+        assertEquals("Build passed (reused #123)", fake.creates.single().outputTitle)
+
+        val restartedRegistry = OpenCheckRunRegistry(file).also { assertTrue(it.load()) }
+        val persistedOutcome = restartedRegistry.entry(identity.promotionId)?.policyOutcome
+        assertEquals(PolicyOutcomeKind.REUSED_SUCCESS, persistedOutcome?.kind)
+        assertEquals(9876L, persistedOutcome?.verifiedBuildId)
+        assertEquals("#123", persistedOutcome?.verifiedBuildNumber)
+        assertEquals("https://teamcity.example/viewLog.html?buildId=9876", persistedOutcome?.detailsUrl)
+        val afterRestart = FakeGitHubClient()
+        val restarted = CheckRunLifecycleCoordinator(restartedRegistry, afterRestart)
+        assertFalse(restarted.publish(identity, "token", repo, request(CheckRunStatus.COMPLETED, "Cancelled", CheckRunConclusion.CANCELLED), "api", "late removal"))
+        assertEquals(1, fake.creates.size)
+        assertTrue(fake.updates.isEmpty())
+        assertTrue(afterRestart.creates.isEmpty())
+    }
+
+    @Test
+    fun `mismatched identity cannot commit another promotion's prepared policy result`(@TempDir tmp: Path) {
+        val fake = FakeGitHubClient()
+        val registry = OpenCheckRunRegistry(tmp.resolve("runs.tsv").toFile())
+        val coordinator = CheckRunLifecycleCoordinator(registry, fake)
+        val identity = identity(71)
+        assertTrue(coordinator.preparePolicyOutcome(identity, skippedPolicyOutcome()))
+
+        assertFalse(coordinator.commitPolicyOutcome(identity.copy(headSha = "different-sha"), "token", repo, "api", "mismatched"))
+        assertTrue(fake.creates.isEmpty())
+        assertEquals(CheckRunCreatePhase.POLICY_PENDING, registry.entry(identity.promotionId)?.createPhase)
+    }
+
+    @Test
+    fun `failed queue removal rolls back the policy result and leaves the queued lifecycle usable`(@TempDir tmp: Path) {
+        val fake = FakeGitHubClient()
+        val registry = OpenCheckRunRegistry(tmp.resolve("runs.tsv").toFile())
+        val coordinator = CheckRunLifecycleCoordinator(registry, fake)
+        val identity = identity(72)
+        val removal = runCatching {
+            coordinator.removeWithPolicyOutcome(identity, skippedPolicyOutcome(), "token", repo, "api", "filtered skip") {
+                error("queue removal failed")
+            }
+        }
+
+        assertTrue(removal.isFailure)
+        assertEquals(null, registry.entry(identity.promotionId)?.policyOutcome)
+        assertEquals(CheckRunCreatePhase.RESERVED, registry.entry(identity.promotionId)?.createPhase)
+        assertTrue(coordinator.publish(identity, "token", repo, request(CheckRunStatus.QUEUED, "Queued"), "api", "queue still present"))
+        assertEquals(1, fake.creates.size)
+        assertEquals(CheckRunStatus.QUEUED, fake.creates.single().status)
+        assertEquals(null, fake.creates.single().conclusion)
+    }
+
+    @Test
+    fun `a build that starts during removal wins over the prepared policy outcome`(@TempDir tmp: Path) {
+        val fake = FakeGitHubClient()
+        val registry = OpenCheckRunRegistry(tmp.resolve("runs.tsv").toFile())
+        val coordinator = CheckRunLifecycleCoordinator(registry, fake)
+        val identity = identity(73)
+        var ownBuildStarted = false
+
+        assertTrue(
+            coordinator.removeWithPolicyOutcome(
+                identity,
+                skippedPolicyOutcome(),
+                "token",
+                repo,
+                "api",
+                "filtered skip",
+                removeFromQueue = { ownBuildStarted = true },
+                removalVerified = { !ownBuildStarted },
+            ),
+        )
+        assertEquals(null, registry.entry(identity.promotionId)?.policyOutcome)
+        assertTrue(coordinator.publish(identity, "token", repo, request(CheckRunStatus.IN_PROGRESS, "Building"), "api", "build started"))
+
+        assertEquals(1, fake.creates.size)
+        assertEquals(CheckRunStatus.IN_PROGRESS, fake.creates.single().status)
+        assertEquals(null, fake.creates.single().conclusion)
+        assertTrue(fake.updates.isEmpty())
     }
 
     @Test
@@ -499,6 +727,24 @@ class CheckRunLifecycleCoordinatorTest {
         conclusion = conclusion,
         outputTitle = title,
         outputSummary = "summary",
+    )
+
+    private fun skippedPolicyOutcome() = CheckRunPolicyOutcome(
+        kind = PolicyOutcomeKind.FILTER_SKIP,
+        conclusion = CheckRunConclusion.SKIPPED,
+        outputTitle = "Skipped: draft PR",
+        outputSummary = "This build configuration intentionally skips draft pull requests.",
+        detailsUrl = "https://teamcity.example/buildType/Bt_A",
+    )
+
+    private fun reusedPolicyOutcome() = CheckRunPolicyOutcome(
+        kind = PolicyOutcomeKind.REUSED_SUCCESS,
+        conclusion = CheckRunConclusion.SUCCESS,
+        outputTitle = "Build passed (reused #123)",
+        outputSummary = "This commit already passed in build #123; the queued build was dropped instead of reproducing a known result.",
+        detailsUrl = "https://teamcity.example/viewLog.html?buildId=9876",
+        verifiedBuildId = 9876,
+        verifiedBuildNumber = "#123",
     )
 
     private class FakeGitHubClient : GitHubClient() {

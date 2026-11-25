@@ -13,14 +13,12 @@ import jetbrains.buildServer.serverSide.SBuildType
 import jetbrains.buildServer.serverSide.WebLinks
 import java.util.concurrent.ConcurrentHashMap
 
-// Posts "Skipped: …" Check Runs to GitHub. No longer a build-server
-// listener: the call sites (PullRequestEventListener,
-// DraftBuildQueueCleaner) explicitly invoke postSkippedCheckRun when
-// the centralized gate says SUPPRESS_DRAFT or SUPPRESS_BRANCH_PR.
+// Posts webhook-only "Skipped: …" Check Runs when a policy decision has
+// no TeamCity promotion identity to attach to. Queue-cleaner outcomes use
+// the durable promotion lifecycle owned by BuildStatusCheckRunPublisher.
 //
-// Idempotent via a per-(sha, BT) dedup set, so multiple webhook
-// retries or the cleaner+listener firing for the same SHA emit at
-// most one Check Run per BT.
+// Idempotent via a per-(sha, BT) dedup set, so webhook retries for the
+// same SHA emit at most one Check Run per BuildType.
 //
 // The set is never invalidated, deliberately: for one commit in one build
 // configuration the Skipped row says the same thing whoever asks, so a second
@@ -118,7 +116,7 @@ class DraftCheckRunReporter(
     }
 }
 
-// Reasons surfaced by `postSkippedCheckRun`. Each maps to a fixed
+    // Reasons surfaced by `postSkippedCheckRun`. Each maps to a fixed
 // title + summary template so the GitHub UI's "Checks" panel shows
 // a consistent message and the user can tell apart draft-deferred
 // skips from branch-out-of-scope skips at a glance.

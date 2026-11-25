@@ -540,18 +540,23 @@ the plugin **removes** any queued build for a draft PR from the queue
 (`DraftBuildQueueCleaner`). It does not hold the build with a wait
 reason; the queue stays clean.
 
-The user still sees the deliberate skip on GitHub through the
-`skipped` Check Run posted by `DraftCheckRunReporter` (visible in
-the PR's "Checks" tab as `TeamCity / <buildType> -> Skipped:
-draft PR`). When the PR is marked ready for review, opened
+The user still sees the deliberate skip on GitHub through one
+`skipped` Check Run for that TeamCity promotion (visible in the PR's
+"Checks" tab as `TeamCity / <buildType> -> Skipped: draft PR`). Before
+removing the queue item, the publisher persists that exact outcome in the
+promotion lifecycle registry. The queue removal callback and later
+reconciliation therefore complete the same run instead of creating a second
+cancelled run, even if the server restarts between removal and publication.
+Webhook policy skips that have no TeamCity promotion continue to use
+`DraftCheckRunReporter`. When the PR is marked ready for review, opened
 directly as ready, or pushed to as a ready PR, the App-level
 webhook fires and `PullRequestEventListener` re-enqueues a fresh
 build on the latest revision.
 
-If the cleaner fails (typically because the GitHub API was
-unreachable when the build hit the queue), `DraftAwareBuildFilter`
-serves as a safety net: the build is held with a draft wait reason
-until the next attempt resolves the PR state.
+If the lifecycle registry cannot save the intended outcome or queue removal
+fails, `DraftAwareBuildFilter` serves as a safety net: the build is held with
+a draft wait reason until a later attempt can safely remove it. A GitHub API
+failure after removal leaves the saved outcome for reconciliation to retry.
 
 **Manual user triggers always run.** Since v1.3.0, the entire
 draft-suppression path (filter, cleaner, skipped-Check-Run reporter,
@@ -870,6 +875,12 @@ A system queue-removal event alone does not produce a successful `skipped` or
 otherwise reconciliation reports a matching completed build or concludes the
 removed promotion as cancelled.
 
+An automatic filter skip or verified `skipIfCommitPassed` reuse is different:
+the cleaner records its approved result for that exact promotion before queue
+removal. A reuse retains the passed build's identity and success details for
+restart recovery. A merely absent lifecycle row or an unverified system removal
+never becomes a policy-approved skip or reuse.
+
 `output.summary` carries the build's `statusDescriptor.text` (i.e.
 whatever the agent set via
 `##teamcity[buildStatus text='...']`). Truncated at 60 000
@@ -883,11 +894,11 @@ queue item is gone within milliseconds). If TC's server rootUrl is
 unset the URL is silently dropped and GitHub falls back to its own
 Check Run page.
 
-The publisher dedups against `DraftCheckRunReporter` so a
-draft-suppressed build receives a single `skipped` row instead of a
-`queued`/`skipped` flicker: `publishQueued` consults `PrInfoCache`
-and yields when the BuildType skips drafts (`triggerOnPrDraft`
-unchecked) on a `pull/N` branch whose PR is draft.
+The publisher consults `PrInfoCache` and the shared queue-cleanup gate before
+publishing `queued`, so a draft-suppressed promotion does not flicker through
+`queued` before its terminal `skipped` result. `DraftCheckRunReporter` handles
+only webhook policy skips without a promotion identity and deduplicates those
+by SHA and BuildType.
 
 ### Choosing the right setup
 

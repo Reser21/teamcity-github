@@ -1,6 +1,7 @@
 package io.github.dlachouette.teamcity.github.report
 
 import com.intellij.openapi.diagnostic.Logger
+import io.github.dlachouette.teamcity.github.api.CheckRunConclusion
 import io.github.dlachouette.teamcity.github.api.CheckRunStatus
 import java.io.File
 import java.io.RandomAccessFile
@@ -13,6 +14,25 @@ import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.util.Base64
 import java.util.UUID
+
+enum class PolicyOutcomeKind {
+    FILTER_SKIP,
+    REUSED_SUCCESS,
+}
+
+/** A queue-cleanup outcome prepared before removal and retained through recovery. */
+data class CheckRunPolicyOutcome(
+    val kind: PolicyOutcomeKind,
+    val conclusion: CheckRunConclusion,
+    val outputTitle: String,
+    val outputSummary: String,
+    val detailsUrl: String? = null,
+    val verifiedBuildId: Long? = null,
+    val verifiedBuildNumber: String? = null,
+    val committed: Boolean = false,
+    val previousPhase: CheckRunCreatePhase? = null,
+    val previousDesiredStatus: CheckRunStatus? = null,
+)
 
 /** Durable identity and progress ledger for every lifecycle Check Run created by this server. */
 class OpenCheckRunRegistry(
@@ -35,6 +55,7 @@ class OpenCheckRunRegistry(
         val confirmedStatus: CheckRunStatus? = null,
         val createPhase: CheckRunCreatePhase = CheckRunCreatePhase.LEGACY,
         val pendingUpdate: Boolean = false,
+        val policyOutcome: CheckRunPolicyOutcome? = null,
     )
 
     private val entries = HashMap<Long, Entry>()
@@ -257,8 +278,9 @@ class OpenCheckRunRegistry(
     private fun isTerminal(entry: Entry): Boolean =
         entry.createPhase == CheckRunCreatePhase.COMPLETED || entry.createPhase == CheckRunCreatePhase.ABANDONED
 
-    private fun encode(entry: Entry): String = listOf(
-        "v2",
+    private fun encode(entry: Entry): String = buildList {
+        add(if (entry.policyOutcome == null) "v2" else "v4")
+        addAll(listOf(
         entry.promotionId.toString(),
         encodeField(entry.buildTypeExternalId),
         encodeField(entry.repoSlug.orEmpty()),
@@ -271,7 +293,9 @@ class OpenCheckRunRegistry(
         entry.createPhase.name,
         entry.pendingUpdate.toString(),
         entry.openedAt.toString(),
-    ).joinToString("\t") + "\n"
+        ))
+        entry.policyOutcome?.let { add(encodePolicyOutcome(it)) }
+    }.joinToString("\t") + "\n"
 
     private fun encodeEvent(entry: Entry): String = "v3\tU\t" + encode(entry).substringAfter('\t')
 
@@ -288,8 +312,9 @@ class OpenCheckRunRegistry(
                 else fields[2].toLongOrNull()?.let(RegistryEvent::Delete)
             }
             "U" -> {
-                if (fields.size != 14) return null
-                val entry = parse((listOf("v2") + fields.drop(2)).joinToString("\t")) ?: return null
+                if (fields.size != 14 && fields.size != 15) return null
+                val rowVersion = if (fields.size == 15) "v4" else "v2"
+                val entry = parse((listOf(rowVersion) + fields.drop(2)).joinToString("\t")) ?: return null
                 RegistryEvent.Upsert(entry)
             }
             else -> null
@@ -309,7 +334,9 @@ class OpenCheckRunRegistry(
                 openedAt = openedAt,
             )
         }
-        if (fields.size != 13 || fields[0] != "v2") return null
+        val isV2 = fields.size == 13 && fields[0] == "v2"
+        val isV4 = fields.size == 14 && fields[0] == "v4"
+        if (!isV2 && !isV4) return null
 
         val id = fields[1].toLongOrNull() ?: return null
         val buildType = decodeField(fields[2]) ?: return null
@@ -324,6 +351,7 @@ class OpenCheckRunRegistry(
         val phase = runCatching { CheckRunCreatePhase.valueOf(fields[10]) }.getOrNull() ?: return null
         val pendingUpdate = fields[11].toBooleanStrictOrNull() ?: return null
         val openedAt = fields[12].toLongOrNull() ?: return null
+        val policyOutcome = if (isV4 && fields[13].isNotEmpty()) decodePolicyOutcome(fields[13]) ?: return null else null
         if (buildType.isBlank() || sha.isBlank()) return null
         if (phase != CheckRunCreatePhase.LEGACY && (repo.isBlank() || checkName.isBlank())) return null
         if (phase != CheckRunCreatePhase.LEGACY && phase != CheckRunCreatePhase.ABANDONED &&
@@ -343,6 +371,63 @@ class OpenCheckRunRegistry(
             confirmedStatus = confirmed,
             createPhase = phase,
             pendingUpdate = pendingUpdate,
+            policyOutcome = policyOutcome,
+        )
+    }
+
+    private fun encodePolicyOutcome(outcome: CheckRunPolicyOutcome?): String {
+        if (outcome == null) return ""
+        return listOf(
+            outcome.kind.name,
+            outcome.conclusion.apiValue,
+            encodeField(outcome.outputTitle),
+            encodeField(outcome.outputSummary),
+            outcome.detailsUrl?.let(::encodeField) ?: NULL_FIELD,
+            outcome.verifiedBuildId?.toString() ?: NULL_FIELD,
+            outcome.verifiedBuildNumber?.let(::encodeField) ?: NULL_FIELD,
+            outcome.committed.toString(),
+            outcome.previousPhase?.name ?: NULL_FIELD,
+            outcome.previousDesiredStatus?.apiValue ?: NULL_FIELD,
+        ).joinToString(":")
+    }
+
+    private fun decodePolicyOutcome(value: String): CheckRunPolicyOutcome? {
+        if (value.isEmpty()) return null
+        val fields = value.split(':')
+        if (fields.size != 10) return null
+        val kind = runCatching { PolicyOutcomeKind.valueOf(fields[0]) }.getOrNull() ?: return null
+        val conclusion = CheckRunConclusion.entries.firstOrNull { it.apiValue == fields[1] } ?: return null
+        val title = decodeField(fields[2]) ?: return null
+        val summary = decodeField(fields[3]) ?: return null
+        val detailsUrl = if (fields[4] == NULL_FIELD) null else decodeField(fields[4]) ?: return null
+        val verifiedBuildId = fields[5].takeIf { it != NULL_FIELD }?.toLongOrNull()
+        if (fields[5] != NULL_FIELD && verifiedBuildId == null) return null
+        val verifiedBuildNumber = if (fields[6] == NULL_FIELD) null else decodeField(fields[6]) ?: return null
+        val committed = fields[7].toBooleanStrictOrNull() ?: return null
+        val previousPhase = fields[8].takeIf { it != NULL_FIELD }?.let {
+            runCatching { CheckRunCreatePhase.valueOf(it) }.getOrNull() ?: return null
+        }
+        val previousDesired = fields[9].takeIf { it != NULL_FIELD }?.let {
+            CheckRunStatus.entries.firstOrNull { status -> status.apiValue == it } ?: return null
+        }
+        if (title.isBlank() || summary.isBlank()) return null
+        if (kind == PolicyOutcomeKind.FILTER_SKIP &&
+            (conclusion != CheckRunConclusion.SKIPPED || verifiedBuildId != null || verifiedBuildNumber != null)
+        ) return null
+        if (kind == PolicyOutcomeKind.REUSED_SUCCESS &&
+            (conclusion != CheckRunConclusion.SUCCESS || verifiedBuildId == null || verifiedBuildNumber.isNullOrBlank())
+        ) return null
+        return CheckRunPolicyOutcome(
+            kind = kind,
+            conclusion = conclusion,
+            outputTitle = title,
+            outputSummary = summary,
+            detailsUrl = detailsUrl,
+            verifiedBuildId = verifiedBuildId,
+            verifiedBuildNumber = verifiedBuildNumber,
+            committed = committed,
+            previousPhase = previousPhase,
+            previousDesiredStatus = previousDesired,
         )
     }
 
@@ -368,6 +453,7 @@ class OpenCheckRunRegistry(
         private val LOG = Logger.getInstance(OpenCheckRunRegistry::class.java.name)
 
         const val FILE_NAME: String = "open-check-runs.tsv"
+        private const val NULL_FIELD = "~"
         const val MAX_JOURNAL_EVENTS: Int = 512
         const val MAX_JOURNAL_BYTES: Long = 1_048_576L
         const val MAX_TERMINAL_ENTRIES: Int = 4_096
@@ -377,6 +463,7 @@ class OpenCheckRunRegistry(
 
 enum class CheckRunCreatePhase {
     RESERVED,
+    POLICY_PENDING,
     POSTING,
     UNCERTAIN,
     RETRYABLE,

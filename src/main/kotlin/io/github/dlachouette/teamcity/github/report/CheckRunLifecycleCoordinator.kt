@@ -2,6 +2,7 @@ package io.github.dlachouette.teamcity.github.report
 
 import com.intellij.openapi.diagnostic.Logger
 import io.github.dlachouette.teamcity.github.api.CheckRunCreateResult
+import io.github.dlachouette.teamcity.github.api.CheckRunConclusion
 import io.github.dlachouette.teamcity.github.api.CheckRunLookup
 import io.github.dlachouette.teamcity.github.api.CheckRunRequest
 import io.github.dlachouette.teamcity.github.api.CheckRunStatus
@@ -50,6 +51,56 @@ class CheckRunLifecycleCoordinator(
         publishLocked(identity, accessToken, repo, request, apiBase, label)
     }
 
+    /** Persist the exact policy-approved terminal result before the queue item is removed. */
+    fun preparePolicyOutcome(identity: CheckRunIdentity, outcome: CheckRunPolicyOutcome): Boolean =
+        registry.withPromotionLock(identity.promotionId) {
+            preparePolicyOutcomeLocked(identity, outcome)
+        }
+
+    /** Roll a prepared result back when TeamCity could not remove the queue item. */
+    fun rollbackPolicyOutcome(identity: CheckRunIdentity): Boolean = registry.withPromotionLock(identity.promotionId) {
+        rollbackPolicyOutcomeLocked(identity)
+    }
+
+    /** Commit a prepared removal and publish its stored terminal result. */
+    fun commitPolicyOutcome(
+        identity: CheckRunIdentity,
+        accessToken: String?,
+        repo: RepoCoords,
+        apiBase: String,
+        label: String,
+    ): Boolean = registry.withPromotionLock(identity.promotionId) {
+        commitPolicyOutcomeLocked(identity, accessToken, repo, apiBase, label)
+    }
+
+    /** Serialize the local removal with queue callbacks and the outcome POST/PATCH. */
+    fun removeWithPolicyOutcome(
+        identity: CheckRunIdentity,
+        outcome: CheckRunPolicyOutcome,
+        accessToken: String?,
+        repo: RepoCoords,
+        apiBase: String,
+        label: String,
+        removalVerified: () -> Boolean = { true },
+        removeFromQueue: () -> Unit,
+    ): Boolean = registry.withPromotionLock(identity.promotionId) {
+        if (!preparePolicyOutcomeLocked(identity, outcome)) return@withPromotionLock false
+        try {
+            removeFromQueue()
+        } catch (e: Exception) {
+            rollbackPolicyOutcomeLocked(identity)
+            throw e
+        }
+        if (!removalVerified()) {
+            rollbackPolicyOutcomeLocked(identity)
+            return@withPromotionLock true
+        }
+        if (!commitPolicyOutcomeLocked(identity, accessToken, repo, apiBase, label)) {
+            LOG.warn("Queue was removed for promotion ${identity.promotionId}; the saved $label Check Run outcome remains pending reconciliation")
+        }
+        true
+    }
+
     /** Resolve a create whose POST may have completed before the server stopped. */
     fun recover(
         identity: CheckRunIdentity,
@@ -67,6 +118,7 @@ class CheckRunLifecycleCoordinator(
             warnMismatch(identity)
             return@withPromotionLock false
         }
+        if (entry.policyOutcome != null) return@withPromotionLock false
         if (entry.checkRunId != null) return@withPromotionLock true
         resolveUnassigned(entry, identity, accessToken, repo, apiBase, createRequest = null) != null
     }
@@ -105,6 +157,7 @@ class CheckRunLifecycleCoordinator(
             warnMismatch(identity)
             return@withPromotionLock false
         }
+        if (entry.policyOutcome != null) return@withPromotionLock true
         if (entry.createPhase == CheckRunCreatePhase.COMPLETED ||
             (entry.createPhase == CheckRunCreatePhase.ABANDONED && entry.checkRunId != null)
         ) {
@@ -177,6 +230,7 @@ class CheckRunLifecycleCoordinator(
             warnMismatch(expectedIdentity)
             return@withPromotionLock false
         }
+        if (entry.policyOutcome != null) return@withPromotionLock true
         if (entry.createPhase == CheckRunCreatePhase.COMPLETED || entry.createPhase == CheckRunCreatePhase.ABANDONED) {
             return@withPromotionLock true
         }
@@ -234,6 +288,7 @@ class CheckRunLifecycleCoordinator(
         request: CheckRunRequest,
         apiBase: String,
         label: String,
+        policyOutcome: CheckRunPolicyOutcome? = null,
     ): Boolean {
         if (!checkUsable(identity, repo)) return false
         if (request.name != identity.checkName || request.headSha != identity.headSha) {
@@ -270,6 +325,19 @@ class CheckRunLifecycleCoordinator(
             return false
         }
 
+        if (entry.policyOutcome != policyOutcome) {
+            if (entry.policyOutcome != null || policyOutcome != null) {
+                LOG.debug("Ignoring non-authoritative Check Run callback for promotion ${identity.promotionId} while a policy outcome owns it")
+                return false
+            }
+        }
+        if (policyOutcome != null && (!policyOutcome.committed || request.status != CheckRunStatus.COMPLETED ||
+                request.conclusion != policyOutcome.conclusion)
+        ) {
+            LOG.warn("Refusing a mismatched policy Check Run outcome for promotion ${identity.promotionId}")
+            return false
+        }
+
         if (entry.createPhase == CheckRunCreatePhase.COMPLETED) return true
         if (entry.createPhase == CheckRunCreatePhase.ABANDONED) return false
 
@@ -298,7 +366,143 @@ class CheckRunLifecycleCoordinator(
         return updateAssigned(entry, identity, accessToken, repo, request.copy(status = desired), apiBase, label)
     }
 
-    /** Lookup first. Only RESERVED and known rate-limit rejections may POST. */
+    private fun preparePolicyOutcomeLocked(identity: CheckRunIdentity, requested: CheckRunPolicyOutcome): Boolean {
+        if (!registry.available) {
+            warnRegistryUnavailable()
+            return false
+        }
+        if (requested.committed || requested.previousPhase != null || requested.previousDesiredStatus != null ||
+            !isValidPolicyOutcome(requested)
+        ) {
+            LOG.warn("Refusing an invalid policy outcome for promotion ${identity.promotionId}")
+            return false
+        }
+        val existing = registry.entry(identity.promotionId)
+        if (existing != null) {
+            if (existing.createPhase == CheckRunCreatePhase.LEGACY) {
+                warnLegacy(existing)
+                return false
+            }
+            if (!identity.matches(existing)) {
+                warnMismatch(identity)
+                return false
+            }
+            val priorIntent = existing.policyOutcome
+            if (priorIntent != null) {
+                return samePolicyResult(priorIntent, requested)
+            }
+            if (existing.createPhase == CheckRunCreatePhase.POLICY_PENDING) return false
+            if (existing.createPhase == CheckRunCreatePhase.COMPLETED) return false
+            if (existing.createPhase == CheckRunCreatePhase.ABANDONED ||
+                existing.createPhase == CheckRunCreatePhase.POSTING ||
+                existing.createPhase == CheckRunCreatePhase.UNCERTAIN ||
+                existing.checkRunId != null && existing.createPhase != CheckRunCreatePhase.ACTIVE
+            ) {
+                LOG.warn("Cannot reserve a policy outcome for promotion ${identity.promotionId}: its Check Run create/update state is not safely owned")
+                return false
+            }
+        }
+        val externalId = existing?.externalId ?: externalIdFor(identity) ?: run {
+            LOG.warn("Cannot reserve a policy outcome for promotion ${identity.promotionId}: no stable Check Run correlation is available")
+            return false
+        }
+        val prepared = requested.copy(
+            previousPhase = existing?.createPhase,
+            previousDesiredStatus = existing?.desiredStatus,
+        )
+        val entry = (existing ?: OpenCheckRunRegistry.Entry(
+            promotionId = identity.promotionId,
+            buildTypeExternalId = identity.buildTypeExternalId,
+            headSha = identity.headSha,
+            openedAt = registry.nowMillis(),
+            repoSlug = identity.repoSlug,
+            checkName = identity.checkName,
+            externalId = externalId,
+            desiredStatus = CheckRunStatus.QUEUED,
+            createPhase = CheckRunCreatePhase.RESERVED,
+        )).copy(
+            externalId = externalId,
+            desiredStatus = existing?.desiredStatus ?: CheckRunStatus.QUEUED,
+            createPhase = CheckRunCreatePhase.POLICY_PENDING,
+            policyOutcome = prepared,
+        )
+        return persist(entry)
+    }
+
+    private fun rollbackPolicyOutcomeLocked(identity: CheckRunIdentity): Boolean {
+        val entry = registry.entry(identity.promotionId) ?: return false
+        if (!identity.matches(entry)) {
+            warnMismatch(identity)
+            return false
+        }
+        val intent = entry.policyOutcome ?: return true
+        if (intent.committed) {
+            LOG.warn("Cannot roll back committed policy outcome for promotion ${identity.promotionId}")
+            return false
+        }
+        val restored = entry.copy(
+            policyOutcome = null,
+            desiredStatus = intent.previousDesiredStatus ?: CheckRunStatus.QUEUED,
+            createPhase = intent.previousPhase ?: CheckRunCreatePhase.RESERVED,
+        )
+        return persist(restored)
+    }
+
+    private fun commitPolicyOutcomeLocked(
+        identity: CheckRunIdentity,
+        accessToken: String?,
+        repo: RepoCoords,
+        apiBase: String,
+        label: String,
+    ): Boolean {
+        if (!checkUsable(identity, repo)) return false
+        val entry = registry.entry(identity.promotionId) ?: return false
+        if (!identity.matches(entry)) {
+            warnMismatch(identity)
+            return false
+        }
+        val intent = entry.policyOutcome ?: return false
+        if (!intent.committed) {
+            val committed = intent.copy(committed = true)
+            val phase = intent.previousPhase ?: CheckRunCreatePhase.RESERVED
+            val next = entry.copy(
+                createPhase = phase,
+                desiredStatus = CheckRunStatus.COMPLETED,
+                policyOutcome = committed,
+            )
+            if (!persist(next)) return false
+        }
+        if (accessToken == null) {
+            LOG.warn("Policy Check Run outcome for promotion ${identity.promotionId} is durable but cannot publish until repository access is restored")
+            return false
+        }
+        val committedEntry = registry.entry(identity.promotionId) ?: return false
+        val committedIntent = committedEntry.policyOutcome ?: return false
+        val request = CheckRunRequest(
+            name = identity.checkName,
+            headSha = identity.headSha,
+            status = CheckRunStatus.COMPLETED,
+            conclusion = committedIntent.conclusion,
+            outputTitle = committedIntent.outputTitle,
+            outputSummary = committedIntent.outputSummary,
+            detailsUrl = committedIntent.detailsUrl,
+        )
+        return publishLocked(identity, accessToken, repo, request, apiBase, label, committedIntent)
+    }
+
+    private fun isValidPolicyOutcome(outcome: CheckRunPolicyOutcome): Boolean = when (outcome.kind) {
+        PolicyOutcomeKind.FILTER_SKIP -> outcome.conclusion == CheckRunConclusion.SKIPPED &&
+            outcome.verifiedBuildId == null && outcome.verifiedBuildNumber == null
+        PolicyOutcomeKind.REUSED_SUCCESS -> outcome.conclusion == CheckRunConclusion.SUCCESS &&
+            outcome.verifiedBuildId != null && outcome.verifiedBuildId > 0 && !outcome.verifiedBuildNumber.isNullOrBlank()
+    } && outcome.outputTitle.isNotBlank() && outcome.outputSummary.isNotBlank()
+
+    private fun samePolicyResult(a: CheckRunPolicyOutcome, b: CheckRunPolicyOutcome): Boolean =
+        a.kind == b.kind && a.conclusion == b.conclusion && a.outputTitle == b.outputTitle &&
+            a.outputSummary == b.outputSummary && a.detailsUrl == b.detailsUrl &&
+            a.verifiedBuildId == b.verifiedBuildId && a.verifiedBuildNumber == b.verifiedBuildNumber
+
+    /** Lookup first. Only a never-started reservation or a known retryable rejection may POST. */
     private fun resolveUnassigned(
         original: OpenCheckRunRegistry.Entry,
         identity: CheckRunIdentity,
@@ -374,6 +578,9 @@ class CheckRunLifecycleCoordinator(
                 confirmed.takeIf(::persist)
             }
             is CheckRunCreateResult.Rejected -> {
+                // Authentication and rate-limit rejections are safe to retry on a
+                // later lifecycle/reconciliation event, but only after the exact
+                // external_id lookup above confirms that no run exists.
                 val phase = if (result.retryable) CheckRunCreatePhase.RETRYABLE else CheckRunCreatePhase.REJECTED
                 persist(posting.copy(createPhase = phase))
                 LOG.warn("GitHub rejected Check Run create for promotion ${identity.promotionId} with HTTP ${result.statusCode}")

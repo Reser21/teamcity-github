@@ -151,6 +151,105 @@ class BuildStatusCheckRunPublisher(
         }
     }
 
+    /** Remove a policy-filtered promotion only after its terminal result is durable. */
+    fun removeQueuedPromotionWithSkippedOutcome(
+        promotionId: Long,
+        buildType: SBuildType,
+        config: BridgeFeatureConfig,
+        prNumber: Int,
+        headSha: String,
+        reason: SkipReason,
+        headRef: String?,
+        removeFromQueue: () -> Unit,
+        removalVerified: () -> Boolean = { true },
+    ): Boolean {
+        val (title, summary) = reason.titleAndSummary(prNumber, headRef)
+        val outcome = CheckRunPolicyOutcome(
+            kind = PolicyOutcomeKind.FILTER_SKIP,
+            conclusion = CheckRunConclusion.SKIPPED,
+            outputTitle = title,
+            outputSummary = summary,
+            detailsUrl = safeUrl { webLinks.getConfigurationHomePageUrl(buildType) },
+        )
+        return removeQueuedPromotionWithOutcome(
+            promotionId, buildType, config, headSha, outcome, "filtered skip", removeFromQueue, removalVerified,
+        )
+    }
+
+    /** Remove an automatic duplicate only with the exact passed build that proved the reuse. */
+    fun removeQueuedPromotionWithReusedSuccess(
+        promotionId: Long,
+        buildType: SBuildType,
+        config: BridgeFeatureConfig,
+        headSha: String,
+        reusedBuild: SBuild,
+        removeFromQueue: () -> Unit,
+        removalVerified: () -> Boolean = { true },
+    ): Boolean {
+        val outcome = CheckRunPolicyOutcome(
+            kind = PolicyOutcomeKind.REUSED_SUCCESS,
+            conclusion = CheckRunConclusion.SUCCESS,
+            outputTitle = "Build passed (reused #${reusedBuild.buildNumber})",
+            outputSummary = "This commit already passed in build #${reusedBuild.buildNumber}; " +
+                "the queued build was dropped instead of reproducing a known result.",
+            detailsUrl = safeUrl { webLinks.getViewResultsUrl(reusedBuild) },
+            verifiedBuildId = reusedBuild.buildId,
+            verifiedBuildNumber = reusedBuild.buildNumber,
+        )
+        return removeQueuedPromotionWithOutcome(
+            promotionId, buildType, config, headSha, outcome, "reused success", removeFromQueue, removalVerified,
+        )
+    }
+
+    private fun removeQueuedPromotionWithOutcome(
+        promotionId: Long,
+        buildType: SBuildType,
+        config: BridgeFeatureConfig,
+        headSha: String,
+        outcome: CheckRunPolicyOutcome,
+        label: String,
+        removeFromQueue: () -> Unit,
+        removalVerified: () -> Boolean,
+    ): Boolean {
+        val publish = config.publishChecks && config.repo.slug.isNotBlank() &&
+            (outcome.kind != PolicyOutcomeKind.FILTER_SKIP || config.prTriggerEnabled) &&
+            serverSettings.isRepoAllowed(config.repo.slug) && !serverSettings.dryRun() && headSha.isNotBlank()
+        if (!publish) {
+            if (serverSettings.dryRun() && config.publishChecks && config.repo.slug.isNotBlank()) {
+                LOG.info("[dry-run] would publish $label Check Run for ${config.repo.slug}@$headSha")
+            }
+            removeFromQueue()
+            return true
+        }
+
+        val identity = CheckRunIdentity(
+            promotionId = promotionId,
+            buildTypeExternalId = buildType.externalId,
+            repoSlug = config.repo.slug,
+            checkName = checkRunName(buildType),
+            headSha = headSha,
+        )
+        val access = tokenResolver.resolveAccessToken(buildType.project, config.connectionId, config.repo)
+        val published = lifecycle.removeWithPolicyOutcome(
+            identity = identity,
+            outcome = outcome,
+            accessToken = access?.token,
+            repo = config.repo,
+            apiBase = access?.apiBase ?: GitHubClient.DEFAULT_API_BASE,
+            label = "queue-removed/$label",
+            removeFromQueue = removeFromQueue,
+            removalVerified = removalVerified,
+        )
+        if (!published) {
+            LOG.warn("Could not durably coordinate $label Check Run for promotion $promotionId; queue item was retained")
+            return false
+        }
+        if (access == null) {
+            LOG.warn("Removed promotion $promotionId with its $label outcome saved; Check Run publication will resume when repository access is restored")
+        }
+        return true
+    }
+
     // `buildRemovedFromQueue` fires for EVERY exit from the queue —
     // the SDK documents it as "started, deleted, optimized, etc.", so
     // a null user does NOT mean "cancelled", and a non-null associated
@@ -548,6 +647,7 @@ class BuildStatusCheckRunPublisher(
         if (entries.isEmpty()) return
         var concluded = 0
         entries.forEach { entry ->
+            var currentEntry = entry
             val promotion = try {
                 buildPromotionManager.findPromotionById(entry.promotionId)
             } catch (e: Exception) {
@@ -561,25 +661,83 @@ class BuildStatusCheckRunPublisher(
                 associatedFinished = associated?.isFinished == true,
             )
             val buildType = promotion?.buildType ?: projectManager.findBuildTypeByExternalId(entry.buildTypeExternalId)
-            if (entry.checkRunId == null && buildType != null) {
+
+            if (entry.policyOutcome != null) {
+                val identity = storedIdentity(entry)
+                if (identity == null) {
+                    LOG.warn("Cannot recover policy outcome for promotion ${entry.promotionId}: its stored Check Run identity is incomplete")
+                    return@forEach
+                }
+                if (!entry.policyOutcome.committed) {
+                    when {
+                        associated != null -> {
+                            if (!lifecycle.rollbackPolicyOutcome(identity)) return@forEach
+                            val restored = openRows.entry(entry.promotionId) ?: entry
+                            if (!buildMatchesCheckIdentity(restored, associated)) {
+                                LOG.warn("Prepared policy outcome for promotion ${entry.promotionId} was cancelled because its associated build has a different Check Run identity")
+                            } else if (associated.isFinished) {
+                                publishCompleted(associated, associated.canceledInfo != null, restored)
+                            } else {
+                                publishInProgress(associated)
+                            }
+                            return@forEach
+                        }
+                        promotion?.queuedBuild != null -> {
+                            if (!lifecycle.rollbackPolicyOutcome(identity)) return@forEach
+                            currentEntry = openRows.entry(entry.promotionId) ?: entry
+                        }
+                    }
+                }
+
+                val pending = openRows.entry(entry.promotionId) ?: currentEntry
+                if (pending.policyOutcome != null) {
+                    val repo = repoFromSlug(pending.repoSlug)
+                    val ctx = buildType?.let { bt ->
+                        BridgeFeatureReader.read(bt)?.let { config -> contextFor(bt, config, pending.headSha) }
+                    }
+                    if (repo == null) {
+                        LOG.warn("Cannot recover policy outcome for promotion ${entry.promotionId}: its stored repository is incomplete")
+                    } else if (!serverSettings.dryRun()) {
+                        val access = ctx?.takeIf {
+                            targetMatchesContext(pending, it) && serverSettings.isRepoAllowed(repo.slug)
+                        }
+                        val published = lifecycle.commitPolicyOutcome(
+                            identity,
+                            access?.accessToken,
+                            repo,
+                            access?.apiBase ?: GitHubClient.DEFAULT_API_BASE,
+                            "policy-outcome/reconciliation",
+                        )
+                        if (published) {
+                            concluded++
+                            metrics.inc(io.github.dlachouette.teamcity.github.web.BridgeMetrics.CHECK_RUNS_POSTED)
+                        } else if (access != null) {
+                            metrics.inc(io.github.dlachouette.teamcity.github.web.BridgeMetrics.CHECK_RUNS_FAILED)
+                        }
+                    }
+                    return@forEach
+                }
+            }
+
+            if (currentEntry.checkRunId == null && buildType != null) {
                 val config = BridgeFeatureReader.read(buildType)?.takeIf { it.publishChecks }
                 val ctx = config?.takeIf { serverSettings.isRepoAllowed(it.repo.slug) }
-                    ?.let { contextFor(buildType, it, entry.headSha) }
+                    ?.let { contextFor(buildType, it, currentEntry.headSha) }
                 if (ctx != null) {
                       val queuedBuild = promotion?.queuedBuild
-                      if (shouldResumeQueuedReservation(entry, action, queuedBuild != null, associated != null)) {
+                      if (shouldResumeQueuedReservation(currentEntry, action, queuedBuild != null, associated != null)) {
                           // RESERVED means no POST was started; RETRYABLE means GitHub
                           // explicitly rejected it (for example, a rate limit). Publish
                           // rechecks external_id before creating, so restart recovery can
                           // safely restore a queued row without replaying an uncertain POST.
                           post(
                               ctx,
-                              entry.promotionId,
+                              currentEntry.promotionId,
                               queuedRequest(ctx, queuedBuild!!, estimateOf(queuedBuild)),
                               "reconciled/queued",
                           )
                       } else {
-                          lifecycle.recover(identityFor(entry.promotionId, ctx), ctx.accessToken, ctx.repo, ctx.apiBase)
+                          lifecycle.recover(identityFor(currentEntry.promotionId, ctx), ctx.accessToken, ctx.repo, ctx.apiBase)
                       }
                 }
             }
@@ -588,21 +746,21 @@ class BuildStatusCheckRunPublisher(
                 ReconcileAction.EXPIRE -> {
                     LOG.info("Concluding stale Check Run of ${entry.buildTypeExternalId}@${entry.headSha}")
                     when {
-                        associated?.isFinished == true -> publishCompleted(associated, associated.canceledInfo != null, entry)
-                        buildType != null -> concludeWithoutBuild(buildType, entry)
-                        else -> lifecycle.abandon(entry.promotionId)
+                        associated?.isFinished == true -> publishCompleted(associated, associated.canceledInfo != null, currentEntry)
+                        buildType != null -> concludeWithoutBuild(buildType, currentEntry)
+                        else -> lifecycle.abandon(currentEntry.promotionId)
                     }
                 }
                 ReconcileAction.PUBLISH_BUILD -> {
                     val finishedBuild = associated!!
-                    if (buildMatchesCheckIdentity(entry, finishedBuild)) {
-                        publishCompleted(finishedBuild, finishedBuild.canceledInfo != null, entry)
+                    if (buildMatchesCheckIdentity(currentEntry, finishedBuild)) {
+                        publishCompleted(finishedBuild, finishedBuild.canceledInfo != null, currentEntry)
                     } else {
-                        LOG.warn("Associated build for promotion ${entry.promotionId} does not match its stored Check Run identity; reconciling from matching history instead")
-                        buildType != null && concludeWithoutBuild(buildType, entry)
+                        LOG.warn("Associated build for promotion ${currentEntry.promotionId} does not match its stored Check Run identity; reconciling from matching history instead")
+                        buildType != null && concludeWithoutBuild(buildType, currentEntry)
                     }
                 }
-                ReconcileAction.PUBLISH_LATEST_ON_COMMIT -> buildType != null && concludeWithoutBuild(buildType, entry)
+                ReconcileAction.PUBLISH_LATEST_ON_COMMIT -> buildType != null && concludeWithoutBuild(buildType, currentEntry)
             }
             if (done) concluded++
         }
@@ -668,6 +826,18 @@ class BuildStatusCheckRunPublisher(
         checkName = checkRunName(ctx.buildType),
         headSha = ctx.headSha,
     )
+
+    private fun storedIdentity(entry: OpenCheckRunRegistry.Entry): CheckRunIdentity? {
+        val repoSlug = entry.repoSlug ?: return null
+        val name = entry.checkName ?: return null
+        return CheckRunIdentity(entry.promotionId, entry.buildTypeExternalId, repoSlug, name, entry.headSha)
+    }
+
+    private fun repoFromSlug(slug: String?): RepoCoords? {
+        val parts = slug?.split('/', limit = 2) ?: return null
+        if (parts.size != 2 || parts.any { it.isBlank() }) return null
+        return RepoCoords(parts[0], parts[1])
+    }
 
     private fun identityForPromotion(promotion: BuildPromotion): CheckRunIdentity? {
         val buildType = promotion.buildType ?: return null
