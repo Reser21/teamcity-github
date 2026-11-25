@@ -7,9 +7,9 @@ import jetbrains.buildServer.serverSide.SBuildType
 
 private val LOG = Logger.getInstance("io.github.dlachouette.teamcity.github.report.ReportHelpers")
 
-// THE Check Run name. GitHub dedups Check Run rows by (name, head_sha),
-// so this string is load-bearing: every lifecycle event for a build
-// must produce the exact same name or GitHub creates a duplicate row.
+// THE Check Run name. Lifecycle updates target the persisted run id, while
+// branch protection and the Checks UI identify the required context by name.
+// Keep it identical across events so one promotion has one stable context.
 // Defined once here so a typo at any call site is impossible.
 //
 // A project may shorten it — see `BridgeProjectParams.CHECK_NAME_STRIP_PREFIX`.
@@ -48,9 +48,8 @@ const val CHECK_NAME_PREFIX: String = "TeamCity / "
 
 // Pure helper — the whole decision, testable without an SBuildType.
 //
-// Renaming a Check Run is **not** cosmetic: GitHub keys a row on
-// `(name, head_sha)`, and a branch protection rule requires a name literally. So
-// the rules here are conservative:
+// Renaming a Check Run is **not** cosmetic: a branch protection rule requires
+// a name literally. So the rules here are conservative:
 //
 //   - the prefix must actually match, or nothing is stripped (a stale setting
 //     after a project move silently does nothing rather than mangling the name);

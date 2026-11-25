@@ -92,7 +92,7 @@ Concretely:
 
 **Reporting — back to GitHub**
 
-- One Check Run per build configuration, through every lifecycle step: queued
+- One Check Run per TeamCity build promotion, updated through every lifecycle step: queued
   (with position and estimated start), in progress, and a conclusion carrying
   the build's real status text, its timings, its test outcome (new failures
   first), artifact links and compiler diagnostics annotated on the diff.

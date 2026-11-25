@@ -2,6 +2,7 @@ package io.github.dlachouette.teamcity.github.report
 
 import com.intellij.openapi.diagnostic.Logger
 import io.github.dlachouette.teamcity.github.api.CheckRunConclusion
+import io.github.dlachouette.teamcity.github.api.CheckRunCreateResult
 import io.github.dlachouette.teamcity.github.api.CheckRunRequest
 import io.github.dlachouette.teamcity.github.api.CheckRunStatus
 import io.github.dlachouette.teamcity.github.api.GitHubClient
@@ -12,14 +13,12 @@ import jetbrains.buildServer.serverSide.SBuildType
 import jetbrains.buildServer.serverSide.WebLinks
 import java.util.concurrent.ConcurrentHashMap
 
-// Posts "Skipped: …" Check Runs to GitHub. No longer a build-server
-// listener: the call sites (PullRequestEventListener,
-// DraftBuildQueueCleaner) explicitly invoke postSkippedCheckRun when
-// the centralized gate says SUPPRESS_DRAFT or SUPPRESS_BRANCH_PR.
+// Posts webhook-only "Skipped: …" Check Runs when a policy decision has
+// no TeamCity promotion identity to attach to. Queue-cleaner outcomes use
+// the durable promotion lifecycle owned by BuildStatusCheckRunPublisher.
 //
-// Idempotent via a per-(sha, BT) dedup set, so multiple webhook
-// retries or the cleaner+listener firing for the same SHA emit at
-// most one Check Run per BT.
+// Idempotent via a per-(sha, BT) dedup set, so webhook retries for the
+// same SHA emit at most one Check Run per BuildType.
 //
 // The set is never invalidated, deliberately: for one commit in one build
 // configuration the Skipped row says the same thing whoever asks, so a second
@@ -69,7 +68,7 @@ class DraftCheckRunReporter(
         val dedupKey = headSha to buildType.externalId
         if (!published.add(dedupKey)) return false
 
-        val ok = gitHubClient.postCheckRun(access.token, config.repo, request, access.apiBase)
+        val ok = gitHubClient.createCheckRun(access.token, config.repo, request, access.apiBase) is CheckRunCreateResult.Created
         if (!ok) {
             published.remove(dedupKey)
             LOG.warn("Skipped Check Run POST failed for ${config.repo.slug}@$headSha (${buildType.externalId})")
@@ -79,10 +78,9 @@ class DraftCheckRunReporter(
         return ok
     }
 
-    // Republish the success of a build that already covered this commit, for
-    // a queued build that was dropped as redundant. Same Check Run name and
-    // same commit as the original build, so GitHub updates that one row; the
-    // details link points at the build that actually ran.
+    // Report the success reused for a queued build that was dropped as
+    // redundant. The Check Run is attached to the queued promotion's commit;
+    // its details link points at the build that actually ran.
     fun postReusedSuccess(
         buildType: SBuildType,
         config: BridgeFeatureConfig,
@@ -107,7 +105,7 @@ class DraftCheckRunReporter(
                 "the queued build was dropped instead of reproducing a known result.",
             detailsUrl = safeUrl { webLinks.getViewResultsUrl(reused) },
         )
-        val ok = gitHubClient.postCheckRun(access.token, config.repo, request, access.apiBase)
+        val ok = gitHubClient.createCheckRun(access.token, config.repo, request, access.apiBase) is CheckRunCreateResult.Created
         if (ok) LOG.info("Republished success of #${reused.buildNumber} for ${config.repo.slug}@$headSha (${buildType.externalId})")
         else LOG.warn("Reused-success Check Run POST failed for ${config.repo.slug}@$headSha (${buildType.externalId})")
         return ok
@@ -118,7 +116,7 @@ class DraftCheckRunReporter(
     }
 }
 
-// Reasons surfaced by `postSkippedCheckRun`. Each maps to a fixed
+    // Reasons surfaced by `postSkippedCheckRun`. Each maps to a fixed
 // title + summary template so the GitHub UI's "Checks" panel shows
 // a consistent message and the user can tell apart draft-deferred
 // skips from branch-out-of-scope skips at a glance.

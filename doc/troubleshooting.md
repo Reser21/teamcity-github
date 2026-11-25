@@ -557,8 +557,8 @@ So wait one sweep (1.11.0+). If it persists:
 | The row predates 1.11.0, which introduced the tracking | Re-run the check once. |
 | Dry-run is on | Nothing is posted, so nothing is tracked. Turn it off on the **Server settings** tab. |
 | The configuration no longer publishes (`publishChecks` off) | Expected: the bridge stopped speaking for it. Re-run once with publication on, or ignore the row. |
-| The build's `head_sha` changed mid-build (force-push) | GitHub keys a row on `(name, head_sha)`, so the old row belongs to a commit the build no longer reports on. Rare; re-run on the new head. |
-| GitHub keeps refusing the post | The dedicated log shows `Check Run POST (...) failed`; usually the App's permissions changed. Run **Verify App configuration** (tab **GitHub App**). |
+| The build's `head_sha` changed mid-build (force-push) | A Check Run stays attached to the SHA it was created for, so the old run belongs to a commit the build no longer reports on. Rare; re-run on the new head. |
+| GitHub keeps refusing the post | The dedicated log shows `Check Run POST returned` or `Check Run publication (...) failed`; usually the App's permissions changed. Run **Verify App configuration** (tab **GitHub App**). |
 
 ## Symptom: a PR Check Run is stuck at "Queued" forever
 
@@ -581,9 +581,11 @@ terminal state.
 finished record (failed to start) as **"Build failed"** (red), so a
 failed dependency reaches a terminal state and can block the merge.
 In a fan-out where every BuildType depends on one build that fails,
-that build and all of its dependents end up "Build failed"; duplicate
-chain promotions that are torn down without a record are ignored so
-they cannot overwrite the real result.
+that build and all of its dependents end up "Build failed". System-removed
+duplicate promotions do not create a competing Check Run; if one already
+opened while queued, that exact run is finalized as **"Skipped before start"**.
+If the bridge cannot resolve its repository configuration or credentials, it
+keeps the run open for reconciliation instead of forgetting it.
 
 ### Verify
 
@@ -638,9 +640,9 @@ hence a row that appears only at start.
 **Upgrade to the version carrying this fix.** The publisher now retries
 the "queued" publish on TeamCity's scheduler (a handful of attempts, a
 fraction of a second apart) until the revision resolves. Each retry
-aborts if the build has meanwhile started or left the queue, so a late
-"Queued" can never overwrite a more advanced `in_progress` / completed
-row (GitHub dedups Check Runs by name + head SHA).
+aborts if the build has meanwhile started or left the queue, and the
+promotion's durable lifecycle state prevents a late "Queued" callback from
+regressing a more advanced `in_progress` / completed Check Run.
 
 ### Verify
 

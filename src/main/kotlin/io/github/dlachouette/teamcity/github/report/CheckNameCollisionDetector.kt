@@ -6,10 +6,10 @@ import jetbrains.buildServer.serverSide.SBuildType
 // Detects build configurations that publish under the same Check Run name to
 // the same repository.
 //
-// GitHub keys a row on `(name, head_sha)`, so two such configurations
-// overwrite each other's row on every shared commit, and the one a branch
-// protection rule sees is whichever finished last. A fixed `checkName` makes
-// this easy to cause by copy-paste, and `checkName.stripPrefix` can too.
+// Two configurations with the same name in one repository create distinct
+// runs, but their check contexts are indistinguishable to branch protection.
+// A fixed `checkName` makes this easy to cause by copy-paste, and
+// `checkName.stripPrefix` can too.
 //
 // Like `BundledPublisherDetector`, this warns and stops there.
 object CheckNameCollisionDetector {

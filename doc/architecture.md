@@ -33,7 +33,7 @@ flowchart TB
         TR[TokenResolver<br/>self-mint primary]:::logic
         ATM[AppTokenMinter<br/>JWT + installation token]:::logic
         ATC[AppTokenCache<br/>per-installation TTL]:::cache
-        GC[GitHubClient<br/>REST + Jackson<br/>getPr / postCheckRun /<br/>listInstallations / mintToken]:::io
+        GC[GitHubClient<br/>REST + Jackson<br/>createCheckRun / updateCheckRun /<br/>listInstallations / mintToken]:::io
         PIC[PrInfoCache<br/>TTL 60s]:::cache
         REL[RecentEventsLog<br/>ring buffer N=100]:::cache
 
@@ -41,8 +41,8 @@ flowchart TB
         DAF[DraftAwareBuildFilter]:::logic
         PBE[PrBuildEnricher<br/>buildStarted]:::logic
         PPT[PrPromotionTagger<br/>queue tag]:::logic
-        DCR[DraftCheckRunReporter<br/>skipped Check Run]:::logic
-        BSCRP[BuildStatusCheckRunPublisher<br/>queued / in_progress / cancelled / completed]:::logic
+        DCR[DraftCheckRunReporter<br/>webhook-only skipped Check Run]:::logic
+        BSCRP[BuildStatusCheckRunPublisher<br/>promotion lifecycle + policy outcomes]:::logic
 
         PWC[PluginWebhookController]:::io
         WIC[WebhookInfoController]:::io
@@ -115,7 +115,7 @@ io.github.dlachouette.teamcity.github
 ├── TeamCityGitHubBridgePlugin       main lifecycle bean
 ├── api/
 │   ├── GitHubClient                 open class, HTTP + Jackson: getPr, prsForCommit, listPrFiles,
-│   │                                compare, postCheckRun, addAssignee, addLabels, isTeamMember,
+│   │                                compare, createCheckRun, updateCheckRun, addAssignee, addLabels, isTeamMember,
 │   │                                branch protection / rulesets, installations, tokens
 │   ├── PrInfoCache                  TTL-based, ConcurrentHashMap over the calls above
 │   ├── PrInfo, RepoCoords           PR snapshot (draft, head sha/ref, head repo, title, body,
@@ -276,7 +276,7 @@ then dispatches by `X-GitHub-Event` to `PullRequestEventListener`:
 | Event | Action(s) | Handler | Effect |
 |---|---|---|---|
 | `pull_request` | `opened`, `reopened`, `ready_for_review`, `synchronize` | `handle` | Opt-in assignment (`opened`) and label rules (`PrLabeler`, also on `edited`), then gate + path-filter and enqueue matching BuildTypes. On `synchronize`, then stop the builds still running on the previous head (`ObsoleteBuildPolicy`), with the stop comment the publisher turns into *"Superseded by …"*. |
-| `pull_request` | `labeled`, `unlabeled`, `edited` | `handle` | Re-evaluate the same commit and enqueue what became eligible. Never posts a `Skipped` row: the commit has not changed, so it would overwrite a result already published for it (`PrAction.reportsSkips`). |
+| `pull_request` | `labeled`, `unlabeled`, `edited` | `handle` | Re-evaluate the same commit and enqueue what became eligible. Any webhook-only `Skipped` row has no TeamCity promotion to attach to and is deduplicated by SHA and BuildType (`PrAction.reportsSkips`). |
 | `pull_request` | `closed` (incl. merged) | `handle` -> `cancelBuildsForClosedPr` | Forget the labels the bridge added, remove the builds still queued for the PR head, and stop the ones still running (`ObsoleteBuildPolicy`). |
 | `pull_request_review` | `submitted` / `state=approved` | `handleReviewApproved` | Enqueue run-on-approval BuildTypes. |
 | `pull_request_review_comment` | `created` | `handleCommentCommand` | Default comment-trigger event (inline PR diff comment): enqueue BuildTypes whose comment trigger phrase matches, if the author association is allowed. |

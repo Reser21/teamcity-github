@@ -347,11 +347,10 @@ flowchart TD
 
 **Actor**: a build configuration opted into the bridge finishes (success or failure).
 
-**Expected outcome**: a GitHub Check Run is posted at every
-lifecycle transition (queued / running / interrupted / finished /
-queue-cancelled), carrying the build's actual status text. GitHub
-dedups by `(name, head_sha)` so the same row transitions through
-every state.
+**Expected outcome**: one GitHub Check Run is created for the TeamCity
+promotion. Later lifecycle transitions (queued / running / interrupted /
+finished / queue-cancelled) update that same run id, carrying the build's
+actual status text. Separate promotions keep separate Check Run ids.
 
 ```mermaid
 sequenceDiagram
@@ -363,27 +362,28 @@ sequenceDiagram
 
     Build->>Pub: buildTypeAddedToQueue
     Pub->>TR: resolveAccessToken
-    Pub->>GC: postCheckRun(status=queued, details_url=<queue page>)
+    Pub->>GC: createCheckRun(status=queued, external_id, details_url=<queue page>)
     GC->>GH: POST /repos/.../check-runs
-    GH-->>GC: 201
+    GH-->>GC: 201 + check_run.id
 
     Build->>Pub: buildStarted
-    Pub->>GC: postCheckRun(status=in_progress, details_url=<build page>)
-    GC->>GH: POST /repos/.../check-runs
-    GH-->>GC: 201
+    Pub->>GC: updateCheckRun(check_run.id, status=in_progress)
+    GC->>GH: PATCH /repos/.../check-runs/{id}
+    GH-->>GC: 200
 
     Note over Build: build runs, agent emits<br/>##teamcity[buildStatus text='3 warnings; 0 errors']
 
     alt user stops the build
         Build->>Pub: buildInterrupted
-        Pub->>GC: postCheckRun(status=completed, conclusion=cancelled)
+        Pub->>GC: updateCheckRun(check_run.id, status=completed, conclusion=cancelled)
+        GC->>GH: PATCH /repos/.../check-runs/{id}
     end
 
     Build->>Pub: buildFinished
     Pub->>Pub: mapBuildOutcome(status, isInterrupted)
-    Pub->>GC: postCheckRun(status=completed,<br/>conclusion=success/failure/cancelled,<br/>summary=<status text>)
-    GC->>GH: POST /repos/.../check-runs
-    GH-->>GC: 201
+    Pub->>GC: updateCheckRun(check_run.id, status=completed,<br/>conclusion=success/failure/cancelled,<br/>summary=<status text>)
+    GC->>GH: PATCH /repos/.../check-runs/{id}
+    GH-->>GC: 200
 ```
 
 What appears on the PR:
@@ -1037,8 +1037,8 @@ flowchart TD
 ```
 
 Matched on the **commit alone**, any ref: a build of `Feature/x` and a build
-of `pull/189` at the same commit are the same Check Run row for GitHub, so
-running both is pure waste.
+of `pull/189` at the same commit would run identical source, so running both
+is pure waste.
 
 **Never applied to an explicit request.** A manual Run, a comment command and
 the **Re-run** / **Re-run all checks** buttons mean "do it again", and they
@@ -1094,12 +1094,12 @@ eligible — a label is now a **trigger**, not only a filter.
 | `labeled` / `unlabeled` | re-evaluate the same commit; enqueue what became eligible |
 | `edited` (title/body) | idem, for the `requirePhrase` / `skipPhrase` gate |
 
-**Why the last two post no "Skipped" row.** A Check Run is keyed on
-`(name, commit)`. These actions do not change the commit, so a build has
-often already reported for it — posting `Skipped: PR metadata out of scope`
-would **overwrite that result**, turning a green row into a skip because
-someone removed a label. So the re-evaluation actions only ever *add* builds;
-they never write a skip row.
+**Why the last two post no "Skipped" row.** These actions do not change the
+commit, so a build has often already reported for it. Posting a separate
+`Skipped: PR metadata out of scope` result under the same check context could
+make branch protection see competing results because someone removed a label.
+So the re-evaluation actions only ever *add* builds; they never write a skip
+row.
 
 ## Scenario 29: from a build in TeamCity to the pull request it is judging
 

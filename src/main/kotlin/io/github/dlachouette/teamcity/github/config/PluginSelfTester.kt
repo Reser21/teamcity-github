@@ -111,8 +111,8 @@ class PluginSelfTester(
     }
 
     // Configuration check: two build configurations publishing the same Check
-    // Run name to one repository overwrite each other's row on every shared
-    // commit. WARN: the plugin works, but the row GitHub shows is a coin toss.
+    // Run name to one repository create separate runs with indistinguishable
+    // check contexts. WARN: branch protection may not express the intended gate.
     private fun testUniqueCheckNames(): TestResult {
         val name = "Unique check names"
         val collisions = try {
@@ -126,7 +126,7 @@ class PluginSelfTester(
         val listed = collisions.take(10).joinToString("; ") { "'${it.checkName}' on ${it.repo}: ${it.buildTypes.joinToString(", ")}" }
         return TestResult(
             name, Status.WARN,
-            "${collisions.size} Check Run name(s) are shared by several build configurations, which overwrite each other's row on GitHub: $listed" +
+            "${collisions.size} Check Run name(s) are shared by several build configurations, so their GitHub check contexts are indistinguishable: $listed" +
                 (if (collisions.size > 10) " (+${collisions.size - 10} more)" else "") +
                 ". Give each its own \"Check name\", or adjust the project's prefix to strip.",
         )

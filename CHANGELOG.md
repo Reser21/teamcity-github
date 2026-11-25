@@ -9,6 +9,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - An automatic build held in the queue by a scope filter (a nightly on a draft pull request) is now removed and reported "Skipped" instead of waiting for ever: the cleanup runs again once TeamCity has bound the build's revision.
+- Removing a queued promotion without an observed build outcome no longer completes its Check Run as `skipped`. The row waits for a matching build result, or is concluded as cancelled when reconciliation finds no matching build.
+- Policy-approved queue skips and verified-success reuse now persist their per-promotion outcome before removal and finish through the same Check Run lifecycle, including after restart; webhook-only skips still publish without a promotion.
+- Explicit 401/403 Check Run create rejections can recover on a later lifecycle or reconciliation event after the exact `external_id` lookup; other permanent 4xx responses remain closed to retry.
 
 ## [1.11.0] - 2026-10-06
 
